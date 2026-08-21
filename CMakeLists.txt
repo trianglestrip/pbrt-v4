@@ -899,6 +899,9 @@ if (PBRT_CUDA_ENABLED AND PBRT_OPTIX_PATH)
     target_include_directories (pbrt_lib SYSTEM PUBLIC ${PBRT_OPTIX_PATH}/include)
 endif ()
 
+# Taskflow (vendored) for parallel CPU work / task graphs during scene upload.
+target_include_directories (pbrt_lib SYSTEM PUBLIC ${PBRT_SOURCE_CODE}/src/ext/taskflow)
+
 target_compile_options (pbrt_lib PUBLIC ${PBRT_CXX_FLAGS})
 
 target_link_libraries (pbrt_lib PRIVATE OpenEXR::OpenEXR pbrt_warnings pbrt_opt $<$<BOOL:PBRT_CUDA_ENABLED>:cuda_build_configuration>)

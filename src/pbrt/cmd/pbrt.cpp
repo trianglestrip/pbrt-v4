@@ -22,6 +22,7 @@
 #include <pbrt/util/string.h>
 #include <pbrt/wavefront/wavefront.h>
 
+#include <chrono>
 #include <string>
 #include <vector>
 
@@ -279,13 +280,21 @@ int main(int argc, char *argv[]) {
         // Parse provided scene description files
         BasicScene scene;
         BasicSceneBuilder builder(&scene);
+        auto parseStart = std::chrono::high_resolution_clock::now();
         ParseFiles(&builder, filenames);
+        auto parseEnd = std::chrono::high_resolution_clock::now();
+        Printf("STAGE_TIMING [parse] %.2f s\n",
+               std::chrono::duration<double>(parseEnd - parseStart).count());
 
         // Render the scene
+        auto renderStart = std::chrono::high_resolution_clock::now();
         if (Options->useGPU || Options->wavefront)
             RenderWavefront(scene);
         else
             RenderCPU(scene);
+        auto renderEnd = std::chrono::high_resolution_clock::now();
+        Printf("STAGE_TIMING [render-total] %.2f s\n",
+               std::chrono::duration<double>(renderEnd - renderStart).count());
 
         LOG_VERBOSE("Memory used after post-render cleanup: %s", GetCurrentRSS());
         // Clean up after rendering the scene

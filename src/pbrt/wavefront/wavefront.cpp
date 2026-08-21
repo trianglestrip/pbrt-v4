@@ -4,6 +4,8 @@
 
 #include <pbrt/wavefront/wavefront.h>
 
+#include <chrono>
+
 #ifdef PBRT_BUILD_GPU_RENDERER
 #include <pbrt/gpu/memory.h>
 #endif  // PBRT_BUILD_GPU_RENDERER
@@ -23,15 +25,23 @@ void RenderWavefront(BasicScene &scene) {
         // members (e.g. maxDepth) concurrently while the GPU is rendering.  In
         // turn, the lambda capture for GPU kernels has to capture *this by
         // value (see the definition of PBRT_CPU_GPU_LAMBDA in pbrt/pbrt.h.).
+        auto buildStart = std::chrono::high_resolution_clock::now();
         integrator =
             new WavefrontPathIntegrator(&CUDATrackedMemoryResource::singleton, scene);
+        auto buildEnd = std::chrono::high_resolution_clock::now();
+        Printf("STAGE_TIMING [gpu-build+upload+bvh] %.2f s\n",
+               std::chrono::duration<double>(buildEnd - buildStart).count());
 #else
         // With more capable unified memory, the WavefrontPathIntegrator can live in
-        // unified memory.  Some cudaMemAdvise calls, to come shortly, let us
+        // unified memory.  Some cudaMemise calls, to come shortly, let us
         // have fast read-only access to it on the CPU.
         Allocator alloc(&CUDATrackedMemoryResource::singleton);
+        auto buildStart = std::chrono::high_resolution_clock::now();
         integrator = alloc.new_object<WavefrontPathIntegrator>(
             &CUDATrackedMemoryResource::singleton, scene);
+        auto buildEnd = std::chrono::high_resolution_clock::now();
+        Printf("STAGE_TIMING [gpu-build+upload+bvh] %.2f s\n",
+               std::chrono::duration<double>(buildEnd - buildStart).count());
 #endif
     } else
 #endif  // PBRT_BUILD_GPU_RENDERER

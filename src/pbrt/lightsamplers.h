@@ -230,7 +230,8 @@ class CompactLightBounds {
 // LightBVHNode Definition
 struct alignas(32) LightBVHNode {
     // LightBVHNode Public Methods
-    LightBVHNode() = default;
+    // (No user-declared default constructor so LightBVHNode remains an aggregate
+    //  and can be initialized with braced-init lists under C++20.)
 
     PBRT_CPU_GPU
     static LightBVHNode MakeLeaf(unsigned int lightIndex, const CompactLightBounds &cb) {

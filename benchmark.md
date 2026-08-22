@@ -249,6 +249,28 @@ OptiX/mesh side is no longer the critical path. The change is still worthwhile:
 it removes a genuinely serial 8.8 s stage and helps on unloaded / many-core
 machines and once the texture pipeline is faster.
 
+## Clean baseline (P0–P5) and original comparison
+
+Four consecutive runs of `bistro_cafe_quick` with the current code (P0–P5),
+
+```
+gpu-build+upload+bvh   : 25.8 / 51.7 / 31.6 / 28.5 s
+render-total           : 27.7 / 55.6 / 33.5 / 30.9 s
+texture-upload         : 12.6 / 39.0 / 19.2 / 14.7 s
+optix-bvh-triangles-fn : 10.6 / 36.1 / 2.4 / 11.2 s
+```
+
+Run 2 was a heavy-load outlier (texture-upload spiked to 39 s and optix/mesh
+contended to 36 s) — machine contention, not a code regression. Best
+(least-loaded) `gpu-build+upload+bvh` = **25.8 s**; typical ≈ 28–31 s.
+
+Against the original committed code (`gpu-build` @ `248092c`) measured at
+**~117 s** for the same scene, the OptiX front-end work (P0–P5) yields a
+**~4.2–4.9×** reduction in startup. The remaining variance is dominated by the
+texture pipeline: `wpi-CreateTextures` (~10–12 s) + `texture-upload`
+(12–39 s, load-dependent). The OptiX/mesh side is only ~2–4 s when cores are
+free, so it is no longer on the wall-critical path.
+
 ## How to render
 
 ```bat

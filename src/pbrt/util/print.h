@@ -292,6 +292,9 @@ template <typename... Args>
 void Printf(const char *fmt, Args &&...args) {
     std::string s = StringPrintf(fmt, std::forward<Args>(args)...);
     fputs(s.c_str(), stdout);
+    // Keep progress/timing lines visible even if the process later crashes or
+    // hangs (stdout is block-buffered when redirected to a file).
+    fflush(stdout);
 }
 
 #ifdef __GNUG__

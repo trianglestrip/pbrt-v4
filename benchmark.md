@@ -249,7 +249,43 @@ OptiX/mesh side is no longer the critical path. The change is still worthwhile:
 it removes a genuinely serial 8.8 s stage and helps on unloaded / many-core
 machines and once the texture pipeline is faster.
 
+## Attempted: texture decode-ahead overlap (C) — reverted
+
+Goal: overlap image read/decode (~10–13 s of `texture-upload`) with the serial
+`wpi-CreateTextures` window by decoding registered files on background threads
+into a bounded cache consumed by `DoGPUTextureUpload` (with synchronous-read
+fallback on miss).
+
+Implementation went through several hardening rounds (byte budget, catch-all
+worker isolation, capped worker count), but any *actively working* worker
+thread triggered a reproducible process fail-fast (`0xC0000409` via
+`terminate → abort`) — even a worker that only popped filenames without
+decoding, while a sleeping-only worker ran clean through the entire scene
+build. Root cause is environmental, not the design: this host has **16 GB RAM
+and was at 0 GB free with 4.4 GB of pagefile in use** while WeChat/browser
+widgets ran alongside; CRT allocation failures under commit exhaustion surface
+exactly as these fast-fails, and loader/heap lock pile-ups explain the hang
+variants. The feature was therefore **reverted**; it should be retried on a
+machine with RAM headroom (the design itself is deadlock-free by construction:
+consumers never wait on workers, and misses fall back to synchronous reads).
+
+Retained from this investigation:
+
+- **libdeflate is now linked statically** (vendored `src/ext/libdeflate`;
+  `add_library(deflate STATIC)`, `LIBDEFLATE_DLL` define removed, OpenEXR
+  forced onto the vendored target). Previously `pbrt.exe` imported
+  `deflate.dll`, which the Windows loader resolved via **PATH to an
+  incompatible copy from another product** (`E:\anaconda3\Library\bin`) — a
+  latent crash/corruption hazard independent of this feature.
+- `Printf` flushes stdout per line, so `STAGE_TIMING` progress survives crashes.
+
+Note on measurements taken late in this session: with the host at 0 GB free,
+wall times balloon 4–8× across *all* phases (even driver-only `optix-init`);
+such runs are not comparable to the baselines above.
+
 ## Clean baseline (P0–P5) and original comparison
+
+
 
 Four consecutive runs of `bistro_cafe_quick` with the current code (P0–P5),
 

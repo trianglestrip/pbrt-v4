@@ -3,6 +3,7 @@
 // SPDX: Apache-2.0
 
 #include <pbrt/wavefront/integrator.h>
+#include <thread>
 
 #include <pbrt/base/medium.h>
 #include <pbrt/cameras.h>
@@ -81,18 +82,23 @@ static void updateMaterialNeeds(
 WavefrontPathIntegrator::WavefrontPathIntegrator(
     pstd::pmr::memory_resource *memoryResource, BasicScene &scene)
     : memoryResource(memoryResource), exitCopyThread(new std::atomic<bool>(false)) {
+    auto wpiStart = std::chrono::high_resolution_clock::now();
     ThreadLocal<Allocator> threadAllocators(
         [memoryResource]() { return Allocator(memoryResource); });
 
     Allocator alloc = threadAllocators.Get();
 
     // Allocate all of the data structures that represent the scene...
+    auto tm0 = std::chrono::high_resolution_clock::now();
     std::map<std::string, Medium> media = scene.CreateMedia();
+    Printf("STAGE_TIMING [wpi-CreateMedia] %.2f s\n",
+           std::chrono::duration<double>(std::chrono::high_resolution_clock::now() -
+                                          tm0).count());
 
     // "haveMedia" is a bit of a misnomer in that determines both whether
     // queues are allocated for the medium sampling kernels and they are
     // launched as well as whether the ray marching shadow ray kernel is
-    // launched... Thus, it will be true if there actually are no media,
+    // launched... Thus, it will be true if there are actually are no media,
     // but some "interface" materials are present in the scene.
     haveMedia = false;
     // Check the shapes and instance definitions...
@@ -113,7 +119,11 @@ WavefrontPathIntegrator::WavefrontPathIntegrator(
 
     // Textures
     LOG_VERBOSE("Starting to create textures");
+    auto tt0 = std::chrono::high_resolution_clock::now();
     NamedTextures textures = scene.CreateTextures();
+    Printf("STAGE_TIMING [wpi-CreateTextures] %.2f s\n",
+           std::chrono::duration<double>(std::chrono::high_resolution_clock::now() -
+                                          tt0).count());
     LOG_VERBOSE("Done creating textures");
 
     LOG_VERBOSE("Starting to create lights");
@@ -122,6 +132,7 @@ WavefrontPathIntegrator::WavefrontPathIntegrator(
 
     infiniteLights = alloc.new_object<pstd::vector<Light>>(alloc);
 
+    auto tl0 = std::chrono::high_resolution_clock::now();
     for (Light l : scene.CreateLights(textures, &shapeIndexToAreaLights)) {
         if (l.Is<UniformInfiniteLight>() || l.Is<ImageInfiniteLight>() ||
             l.Is<PortalImageInfiniteLight>())
@@ -129,16 +140,36 @@ WavefrontPathIntegrator::WavefrontPathIntegrator(
 
         allLights.push_back(l);
     }
+    Printf("STAGE_TIMING [wpi-CreateLights] %.2f s\n",
+           std::chrono::duration<double>(std::chrono::high_resolution_clock::now() -
+                                          tl0).count());
     LOG_VERBOSE("Done creating lights");
 
     LOG_VERBOSE("Starting to create materials");
     std::map<std::string, pbrt::Material> namedMaterials;
     std::vector<pbrt::Material> materials;
+    auto tmat0 = std::chrono::high_resolution_clock::now();
     scene.CreateMaterials(textures, &namedMaterials, &materials);
+    Printf("STAGE_TIMING [wpi-CreateMaterials] %.2f s\n",
+           std::chrono::duration<double>(std::chrono::high_resolution_clock::now() -
+                                          tmat0).count());
 
+    Printf("STAGE_TIMING [wpi-pre-flush] %.2f s\n",
+           std::chrono::duration<double>(std::chrono::high_resolution_clock::now() -
+                                          wpiStart)
+               .count());
+    auto wpiPostStart = std::chrono::high_resolution_clock::now();
+
+    // Deferred GPU texture uploads: kick them off on a background thread so
+    // the (parallel, Taskflow) image read/decode + GPU upload overlaps with
+    // the OptiX acceleration-structure build and the rest of scene setup that
+    // follows. The upload target is device memory (not managed memory), so
+    // this does not conflict with the DisableThreadPool managed-memory
+    // constraint. We join at the end of the constructor so all texObjs are
+    // populated before rendering starts.
+    std::thread textureUploadThread;
 #ifdef PBRT_BUILD_GPU_RENDERER
-    // Execute all deferred GPU texture uploads in parallel (Taskflow).
-    FlushGPUTextureUploads();
+    textureUploadThread = std::thread([]() { FlushGPUTextureUploads(); });
 #endif
 
     haveBasicEvalMaterial.fill(false);
@@ -290,6 +321,16 @@ WavefrontPathIntegrator::WavefrontPathIntegrator(
         pathIntegratorBytes += endSize - startSize;
     }
 #endif  // PBRT_BUILD_GPU_RENDERER
+
+    Printf("STAGE_TIMING [wpi-post-flush] %.2f s\n",
+           std::chrono::duration<double>(std::chrono::high_resolution_clock::now() -
+                                          wpiPostStart)
+               .count());
+
+    // Wait for the background texture upload (launched above) to finish so
+    // all GPU texObjs are ready before rendering.
+    if (textureUploadThread.joinable())
+        textureUploadThread.join();
 }
 
 // WavefrontPathIntegrator Method Definitions

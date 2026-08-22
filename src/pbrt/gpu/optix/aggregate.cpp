@@ -22,8 +22,17 @@
 #include <pbrt/wavefront/intersect.h>
 
 #include <atomic>
+#include <chrono>
 #include <mutex>
 #include <unordered_map>
+
+// Cumulative wall-clock spent in optixAccelBuild (incl. compaction) across all
+// GAS builds in one OptiXAggregate construction, in microseconds. Used for
+// STAGE_TIMING only.
+static std::atomic<uint64_t> g_optixBuildTimeUs{0};
+// Cumulative wall-clock spent in per-mesh cudaMalloc + cudaMemcpy (the
+// "upload" portion of buildBVHForTriangles), in microseconds.
+static std::atomic<uint64_t> g_optixUploadUs{0};
 
 #include <optix.h>
 #include <optix_function_table_definition.h>
@@ -112,6 +121,7 @@ OptixTraversableHandle OptiXAggregate::buildOptixBVH(
     ThreadLocal<cudaStream_t> &threadCUDAStreams) {
     if (buildInputs.empty())
         return {};
+    auto buildStart = std::chrono::high_resolution_clock::now();
 
     // Figure out memory requirements.
     OptixAccelBuildOptions accelOptions = {};
@@ -173,6 +183,11 @@ OptixTraversableHandle OptiXAggregate::buildOptixBVH(
     }
 
     CUDA_CHECK(cudaFree(compactedSizePtr));
+
+    auto buildEnd = std::chrono::high_resolution_clock::now();
+    g_optixBuildTimeUs.fetch_add(
+        std::chrono::duration_cast<std::chrono::microseconds>(buildEnd - buildStart).count(),
+        std::memory_order_relaxed);
 
     return traversableHandle;
 }
@@ -364,6 +379,8 @@ OptiXAggregate::BVH OptiXAggregate::buildBVHForTriangles(
     if (nMeshes == 0)
         return {};
 
+    auto bvhStart = std::chrono::high_resolution_clock::now();
+
     std::vector<TriangleMesh *> meshes(nMeshes, nullptr);
     std::vector<Bounds3f> meshBounds(nMeshes);
     ParallelFor(0, nMeshes, [&](int64_t meshIndex) {
@@ -440,6 +457,29 @@ OptiXAggregate::BVH OptiXAggregate::buildBVHForTriangles(
     std::vector<CUdeviceptr> pDeviceDevicePtrs(nMeshes);
     std::vector<uint32_t> triangleInputFlags(nMeshes);
 
+    // Per-mesh geometry sources, gathered during the parallel loop and
+    // uploaded in bulk afterward (P1: replaces per-mesh cudaMalloc/cudaMemcpy).
+    std::vector<const Point3f *> meshVertPtr(nMeshes, nullptr);
+    std::vector<int> meshVertCount(nMeshes, 0);
+    std::vector<const int *> meshIdxPtr(nMeshes, nullptr);
+    std::vector<int> meshIdxCount(nMeshes, 0);
+
+    // P4: the SBT record header depends only on the program group, so the
+    // three headers are identical for every mesh. Capture them once here and
+    // memcpy them into each record instead of calling
+    // optixSbtRecordPackHeader (an OptiX API call) 3x per mesh.
+    std::array<uint8_t, OPTIX_SBT_RECORD_HEADER_SIZE> intersectHdr, randomHitHdr,
+        shadowHdr;
+    {
+        HitgroupRecord dummy;
+        OPTIX_CHECK(optixSbtRecordPackHeader(intersectPG, &dummy));
+        memcpy(intersectHdr.data(), &dummy, OPTIX_SBT_RECORD_HEADER_SIZE);
+        OPTIX_CHECK(optixSbtRecordPackHeader(randomHitPG, &dummy));
+        memcpy(randomHitHdr.data(), &dummy, OPTIX_SBT_RECORD_HEADER_SIZE);
+        OPTIX_CHECK(optixSbtRecordPackHeader(shadowPG, &dummy));
+        memcpy(shadowHdr.data(), &dummy, OPTIX_SBT_RECORD_HEADER_SIZE);
+    }
+
     std::mutex boundsMutex;
     ParallelFor(0, nMeshes, [&](int64_t startIndex, int64_t endIndex) {
         Allocator alloc = threadAllocators.Get();
@@ -456,39 +496,21 @@ OptiXAggregate::BVH OptiXAggregate::buildBVHForTriangles(
 
             input.triangleArray.vertexFormat = OPTIX_VERTEX_FORMAT_FLOAT3;
             input.triangleArray.numVertices = mesh->nVertices;
-#ifdef PBRT_FLOAT_AS_DOUBLE
-            // Convert the vertex positions to 32-bit floats before giving
-            // them to OptiX, since it doesn't support double-precision
-            // geometry.
             input.triangleArray.vertexStrideInBytes = 3 * sizeof(float);
-            float *pGPU;
-            std::vector<float> p32(3 * mesh->nVertices);
-            for (int i = 0; i < mesh->nVertices; i++) {
-                p32[3*i] = mesh->p[i].x;
-                p32[3*i+1] = mesh->p[i].y;
-                p32[3*i+2] = mesh->p[i].z;
-            }
-            CUDA_CHECK(cudaMalloc(&pGPU, mesh->nVertices * 3 * sizeof(float)));
-            CUDA_CHECK(cudaMemcpy(pGPU, p32.data(), mesh->nVertices * 3 *  sizeof(float),
-                                  cudaMemcpyHostToDevice));
-#else
-            input.triangleArray.vertexStrideInBytes = sizeof(Point3f);
-            Point3f *pGPU;
-            CUDA_CHECK(cudaMalloc(&pGPU, mesh->nVertices * sizeof(Point3f)));
-            CUDA_CHECK(cudaMemcpy(pGPU, mesh->p, mesh->nVertices * sizeof(Point3f),
-                                  cudaMemcpyHostToDevice));
-#endif
-            pDeviceDevicePtrs[meshIndex] = CUdeviceptr(pGPU);
+            // Vertex/index data is uploaded in bulk after the parallel loop
+            // (see below) rather than with one cudaMalloc+cudaMemcpy per mesh.
+            meshVertPtr[meshIndex] = mesh->p;
+            meshVertCount[meshIndex] = mesh->nVertices;
+            meshIdxPtr[meshIndex] = mesh->vertexIndices;
+            meshIdxCount[meshIndex] = mesh->nTriangles;
+
+            pDeviceDevicePtrs[meshIndex] = CUdeviceptr(nullptr);
             input.triangleArray.vertexBuffers = &pDeviceDevicePtrs[meshIndex];
 
             input.triangleArray.indexFormat = OPTIX_INDICES_FORMAT_UNSIGNED_INT3;
             input.triangleArray.indexStrideInBytes = 3 * sizeof(int);
             input.triangleArray.numIndexTriplets = mesh->nTriangles;
-            int *indicesGPU;
-            CUDA_CHECK(cudaMalloc(&indicesGPU, mesh->nTriangles * 3 * sizeof(int)));
-            CUDA_CHECK(cudaMemcpy(indicesGPU, mesh->vertexIndices, mesh->nTriangles * 3 * sizeof(int),
-                                  cudaMemcpyHostToDevice));
-            input.triangleArray.indexBuffer = CUdeviceptr(indicesGPU);
+            input.triangleArray.indexBuffer = CUdeviceptr(nullptr);
 
             FloatTexture alphaTexture = getAlphaTexture(shape, floatTextures, alloc);
             Material material = getMaterial(shape, namedMaterials, materials);
@@ -504,7 +526,7 @@ OptiXAggregate::BVH OptiXAggregate::buildBVHForTriangles(
             input.triangleArray.sbtIndexOffsetStrideInBytes = 0;
 
             HitgroupRecord hgRecord;
-            OPTIX_CHECK(optixSbtRecordPackHeader(intersectPG, &hgRecord));
+            memcpy(&hgRecord, intersectHdr.data(), OPTIX_SBT_RECORD_HEADER_SIZE);
             hgRecord.triRec.mesh = mesh;
             hgRecord.triRec.material = material;
             hgRecord.triRec.alphaTexture = alphaTexture;
@@ -526,10 +548,10 @@ OptiXAggregate::BVH OptiXAggregate::buildBVHForTriangles(
 
             bvh.intersectHGRecords[meshIndex] = hgRecord;
 
-            OPTIX_CHECK(optixSbtRecordPackHeader(randomHitPG, &hgRecord));
+            memcpy(&hgRecord, randomHitHdr.data(), OPTIX_SBT_RECORD_HEADER_SIZE);
             bvh.randomHitHGRecords[meshIndex] = hgRecord;
 
-            OPTIX_CHECK(optixSbtRecordPackHeader(shadowPG, &hgRecord));
+            memcpy(&hgRecord, shadowHdr.data(), OPTIX_SBT_RECORD_HEADER_SIZE);
             bvh.shadowHGRecords[meshIndex] = hgRecord;
 
             localBounds = Union(localBounds, meshBounds[meshIndex]);
@@ -539,9 +561,78 @@ OptiXAggregate::BVH OptiXAggregate::buildBVHForTriangles(
         bvh.bounds = Union(bvh.bounds, localBounds);
     });
 
+    // --- Bulk geometry upload (P1) -----------------------------------------
+    // Concatenate all meshes' vertex/index data into single host staging
+    // buffers and issue one cudaMalloc + cudaMemcpy per buffer, instead of
+    // thousands of per-mesh synchronous allocations (the dominant startup
+    // cost on heavy scenes).
+    auto align16 = [](size_t x) { return (x + size_t(15)) & ~size_t(15); };
+    std::vector<size_t> vertOffsetBytes(nMeshes), idxOffsetBytes(nMeshes);
+    size_t totalVertBytes = 0, totalIdxBytes = 0;
+    for (size_t i = 0; i < nMeshes; ++i) {
+        size_t vBytes = size_t(meshVertCount[i]) * 3 * sizeof(float);
+        vertOffsetBytes[i] = align16(totalVertBytes);
+        totalVertBytes = vertOffsetBytes[i] + vBytes;
+        size_t iBytes = size_t(meshIdxCount[i]) * 3 * sizeof(int);
+        idxOffsetBytes[i] = align16(totalIdxBytes);
+        totalIdxBytes = idxOffsetBytes[i] + iBytes;
+    }
+
+    std::vector<float> allVerts(totalVertBytes / sizeof(float), 0.f);
+    std::vector<int> allIdx(totalIdxBytes / sizeof(int), 0);
+    for (size_t i = 0; i < nMeshes; ++i) {
+        if (meshVertCount[i] > 0) {
+            float *dst = &allVerts[vertOffsetBytes[i] / sizeof(float)];
+#ifdef PBRT_FLOAT_AS_DOUBLE
+            for (int v = 0; v < meshVertCount[i]; ++v) {
+                dst[3 * v] = float(meshVertPtr[i][v].x);
+                dst[3 * v + 1] = float(meshVertPtr[i][v].y);
+                dst[3 * v + 2] = float(meshVertPtr[i][v].z);
+            }
+#else
+            memcpy(dst, meshVertPtr[i], meshVertCount[i] * 3 * sizeof(float));
+#endif
+        }
+        if (meshIdxCount[i] > 0) {
+            int *dstIdx = &allIdx[idxOffsetBytes[i] / sizeof(int)];
+            memcpy(dstIdx, meshIdxPtr[i], meshIdxCount[i] * 3 * sizeof(int));
+        }
+    }
+
+    auto upStart = std::chrono::high_resolution_clock::now();
+    float *vertDev = nullptr;
+    int *idxDev = nullptr;
+    if (totalVertBytes > 0) {
+        CUDA_CHECK(cudaMalloc(&vertDev, totalVertBytes));
+        CUDA_CHECK(cudaMemcpy(vertDev, allVerts.data(), totalVertBytes,
+                              cudaMemcpyHostToDevice));
+    }
+    if (totalIdxBytes > 0) {
+        CUDA_CHECK(cudaMalloc(&idxDev, totalIdxBytes));
+        CUDA_CHECK(cudaMemcpy(idxDev, allIdx.data(), totalIdxBytes,
+                              cudaMemcpyHostToDevice));
+    }
+    auto upEnd = std::chrono::high_resolution_clock::now();
+    g_optixUploadUs.fetch_add(
+        std::chrono::duration_cast<std::chrono::microseconds>(upEnd - upStart).count(),
+        std::memory_order_relaxed);
+
+    for (size_t i = 0; i < nMeshes; ++i) {
+        pDeviceDevicePtrs[i] = CUdeviceptr(vertDev) + vertOffsetBytes[i];
+        optixBuildInputs[i].triangleArray.vertexBuffers = &pDeviceDevicePtrs[i];
+        optixBuildInputs[i].triangleArray.indexBuffer =
+            CUdeviceptr(idxDev) + idxOffsetBytes[i];
+    }
+
     bvh.traversableHandle =
         buildOptixBVH(optixContext, optixBuildInputs, threadCUDAStreams);
 
+    auto bvhEnd = std::chrono::high_resolution_clock::now();
+    Printf("STAGE_TIMING [optix-bvh-triangles-fn] %.2f s (nMeshes=%llu)\n",
+           std::chrono::duration<double>(bvhEnd - bvhStart).count(),
+           (unsigned long long)nMeshes);
+    Printf("STAGE_TIMING [optix-bvh-triangles-upload] %.2f s\n",
+           g_optixUploadUs.load() / 1e6);
     return bvh;
 }
 
@@ -1188,6 +1279,7 @@ OptiXAggregate::OptiXAggregate(
     const std::map<std::string, pbrt::Material> &namedMaterials,
     const std::vector<pbrt::Material> &materials)
     : memoryResource(memoryResource), cudaStream(nullptr) {
+    auto initStart = std::chrono::high_resolution_clock::now();
     CUcontext cudaContext;
     CU_CHECK(cuCtxGetCurrent(&cudaContext));
     CHECK(cudaContext != nullptr);
@@ -1386,8 +1478,15 @@ OptiXAggregate::OptiXAggregate(
             ErrorExit(&shape.loc, "%s: unknown shape", shape.name);
 
     LOG_VERBOSE("Starting to read PLY meshes");
+    auto initEnd = std::chrono::high_resolution_clock::now();
+    Printf("STAGE_TIMING [optix-init] %.2f s\n",
+           std::chrono::duration<double>(initEnd - initStart).count());
+    auto plyStart = std::chrono::high_resolution_clock::now();
     std::map<int, TriQuadMesh> plyMeshes =
         PreparePLYMeshes(scene.shapes, textures.floatTextures);
+    auto plyEnd = std::chrono::high_resolution_clock::now();
+    Printf("STAGE_TIMING [optix-prepare-ply] %.2f s\n",
+           std::chrono::duration<double>(plyEnd - plyStart).count());
     LOG_VERBOSE("Finished reading PLY meshes");
 
     struct GAS {
@@ -1402,6 +1501,7 @@ OptiXAggregate::OptiXAggregate(
         int sbtOffset = addHGRecords(triangleBVH);
         return new GAS{std::move(triangleBVH), sbtOffset};
     });
+    auto topGasStart = std::chrono::high_resolution_clock::now();
 
     AsyncJob<GAS *> *blpJob = RunAsync([&]() {
         BVH blpBVH =
@@ -1421,6 +1521,10 @@ OptiXAggregate::OptiXAggregate(
         int quadricSBTOffset = addHGRecords(quadricBVH);
         return new GAS{std::move(quadricBVH), quadricSBTOffset};
     });
+    auto topGasEnd = std::chrono::high_resolution_clock::now();
+    Printf("STAGE_TIMING [optix-top-gas-builds] %.2f s\n",
+           std::chrono::duration<double>(topGasEnd - topGasStart).count());
+    auto iasDefsStart = std::chrono::high_resolution_clock::now();
 
     ///////////////////////////////////////////////////////////////////////////
     // Create IASes for instance definitions
@@ -1493,7 +1597,9 @@ OptiXAggregate::OptiXAggregate(
         std::lock_guard<std::mutex> lock(instanceMapMutex);
         instanceMap[def.first] = inst;
     });
-
+    auto iasDefsEnd = std::chrono::high_resolution_clock::now();
+    Printf("STAGE_TIMING [optix-ias-instance-defs] %.2f s\n",
+           std::chrono::duration<double>(iasDefsEnd - iasDefsStart).count());
     LOG_VERBOSE("Finished creating IASes for instance definitions");
 
     ///////////////////////////////////////////////////////////////////////////
@@ -1539,8 +1645,16 @@ OptiXAggregate::OptiXAggregate(
     gasInstance.flags =
         OPTIX_INSTANCE_FLAG_NONE;  // TODO: OPTIX_INSTANCE_FLAG_DISABLE_ANYHIT
     LOG_VERBOSE("Starting to consume top-level GAS futures");
+    auto optixInstStart = std::chrono::high_resolution_clock::now();
+    const char *topJobNames[3] = {"tri", "blp", "quad"};
+    int topJobIdx = 0;
     for (AsyncJob<GAS *> *job : {triJob, blpJob, quadricJob}) {
+        auto jt0 = std::chrono::high_resolution_clock::now();
         GAS *gas = job->GetResult();
+        auto jt1 = std::chrono::high_resolution_clock::now();
+        Printf("STAGE_TIMING [optix-top-build-%s] %.2f s\n", topJobNames[topJobIdx],
+               std::chrono::duration<double>(jt1 - jt0).count());
+        ++topJobIdx;
         if (gas->bvh.traversableHandle) {
             gasInstance.traversableHandle = gas->bvh.traversableHandle;
             gasInstance.sbtOffset = gas->sbtOffset;
@@ -1617,6 +1731,9 @@ OptiXAggregate::OptiXAggregate(
         bounds = Union(bounds, localBounds);
     });
     LOG_VERBOSE("Finished creating OptixInstances");
+    auto optixInstEnd = std::chrono::high_resolution_clock::now();
+    Printf("STAGE_TIMING [optix-instances] %.2f s\n",
+           std::chrono::duration<double>(optixInstEnd - optixInstStart).count());
 
     ///////////////////////////////////////////////////////////////////////////
     // Build the top-level IAS
@@ -1633,6 +1750,8 @@ OptiXAggregate::OptiXAggregate(
     LOG_VERBOSE("Finished building top-level IAS");
 
     LOG_VERBOSE("Finished creating shapes and acceleration structures");
+    Printf("STAGE_TIMING [optix-accelbuild-total] %.2f s\n",
+           g_optixBuildTimeUs.load() / 1e6);
 
     if (!scene.animatedShapes.empty())
         Warning("Ignoring %d animated shapes", scene.animatedShapes.size());
@@ -1660,6 +1779,10 @@ OptiXAggregate::OptiXAggregate(
     randomHitSBT.hitgroupRecordBase = randomHitHGRBDevicePtr;
     randomHitSBT.hitgroupRecordStrideInBytes = sizeof(HitgroupRecord);
     randomHitSBT.hitgroupRecordCount = randomHitHGRecords.size();
+
+    auto ctorEnd = std::chrono::high_resolution_clock::now();
+    Printf("STAGE_TIMING [optix-ctor-total] %.2f s\n",
+           std::chrono::duration<double>(ctorEnd - initStart).count());
 
 #ifdef PBRT_IS_WINDOWS
     if (Options->useGPU)

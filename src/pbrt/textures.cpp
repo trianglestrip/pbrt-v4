@@ -1045,6 +1045,7 @@ static size_t RegisterPendingGPUTextureUpload(PendingGPUTextureUpload task) {
 // OptiX acceleration structure is built / rendering starts.  Declared in
 // <pbrt/gpu/gpu_texture_upload.h>.
 void FlushGPUTextureUploads() {
+    auto flushStart = std::chrono::high_resolution_clock::now();
     std::vector<PendingGPUTextureUpload> tasks;
     {
         std::lock_guard<std::mutex> lock(pendingUploadMutex);
@@ -1052,8 +1053,10 @@ void FlushGPUTextureUploads() {
         pendingGPUTextureUploads.clear();
         pendingUploadsByName.clear();
     }
-    if (tasks.empty())
+    if (tasks.empty()) {
+        Printf("STAGE_TIMING [texture-upload] 0.00 s (no tasks)\n");
         return;
+    }
 
     std::vector<std::function<void()>> closures;
     closures.reserve(tasks.size());
@@ -1073,6 +1076,10 @@ void FlushGPUTextureUploads() {
         });
     }
     RunParallelTasks(std::move(closures));
+    auto flushEnd = std::chrono::high_resolution_clock::now();
+    Printf("STAGE_TIMING [texture-upload] %.2f s (%llu unique textures)\n",
+           std::chrono::duration<double>(flushEnd - flushStart).count(),
+           (unsigned long long)tasks.size());
 }
 
 struct LuminanceTextureCacheItem {

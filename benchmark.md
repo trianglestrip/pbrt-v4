@@ -28,21 +28,46 @@ Switching the whole build to C++20 was attempted and reverted:
 
 ## Stage timing (the key finding)
 
-Instrumentation added (`STAGE_TIMING` prints) in `cmd/pbrt.cpp` (parse) and
-`wavefront/wavefront.cpp` (GPU build/upload/BVH vs. render). Quick scene
+Instrumentation added (`STAGE_TIMING` prints) in `cmd/pbrt.cpp` (parse),
+`wavefront/wavefront.cpp` (GPU build/upload/BVH vs. render),
+`gpu/optix/aggregate.cpp` (OptiX ctor phases, bulk-upload timing) and
+`textures.cpp` (texture upload). Quick scene
 `bistro/bistro_cafe_quick.pbrt` (640×360, 8 spp), RTX 2060 SUPER, OptiX 8.0.0:
 
+**Before any front-end optimization** (~110 s fixed startup):
 ```
 STAGE_TIMING [parse]                2.53 s
 STAGE_TIMING [gpu-build+upload+bvh] 113.98 s   <-- dominates
 STAGE_TIMING [render-total]         115.97 s
 ```
 
-The actual GPU ray tracing finishes in well under ~2 s (tiles done almost
-instantly); **~98% of wall-clock is `gpu-build+upload+bvh`** — i.e. CPU-side
-scene construction + texture decode/upload + OptiX acceleration-structure build.
-This is the exact stage targeted by the planned memory-mapped file reads and
-Taskflow-parallel upload.
+The actual GPU ray tracing finishes in well under ~2 s; **~98% of wall-clock was
+`gpu-build+upload+bvh`**. Detailed phase instrumentation then showed the OptiX
+GPU build itself is trivial (**~0.2 s**) — the time was almost entirely
+**CPU-side per-mesh geometry upload + scene/texture construction**.
+
+**After P0 (instrumentation) + P1 (bulk geometry upload) + P4 (SBT header
+precompute)** — `gpu-build+upload+bvh` dropped to **~28 s** (≈ 4.2× faster),
+pixel-identical output:
+```
+STAGE_TIMING [parse]                 0.26 s
+STAGE_TIMING [wpi-pre-flush]        13.66 s   CreateTextures/Lights/Materials (image read/decode)
+STAGE_TIMING [texture-upload]        9.64 s   147 unique textures -> GPU
+STAGE_TIMING [optix-init]            0.20 s
+STAGE_TIMING [optix-prepare-ply]     1.22 s
+STAGE_TIMING [optix-bvh-triangles-fn] 2.81 s  (nMeshes=1591)
+STAGE_TIMING [optix-bvh-triangles-upload] 0.06 s   <-- was 58.15 s before P1
+STAGE_TIMING [optix-instances]       2.82 s
+STAGE_TIMING [optix-accelbuild-total] 0.25 s
+STAGE_TIMING [wpi-post-flush]       14.18 s   light preprocess/sampler + queue alloc
+STAGE_TIMING [gpu-build+upload+bvh] 27.85 s
+STAGE_TIMING [render-total]          29.67 s
+```
+
+(Note: `optix-ctor-total` ≈ 4.2 s is a subset of `wpi-post-flush`; the two
+overlap, which is why the per-phase sum slightly exceeds the total. Per-run
+absolute numbers vary with machine load — `optix-prepare-ply` swings 1–8 s —
+but the *relative* breakdown is stable.)
 
 ## End-to-end wall-clock (OptiX 8.0.0)
 
@@ -50,7 +75,7 @@ Taskflow-parallel upload.
 |----------------------------------|------------------|---------|-------------------------------|
 | `bistro/bistro_cafe.pbrt`       | 1920×1080 / 256 | ~481 s* | `bistro_cafe.exr`             |
 | `bistro/bistro_cafe_med.pbrt`   | 720×405 / 32    | ~101 s  | `bistro_cafe_med.exr`         |
-| `bistro/bistro_cafe_quick.pbrt` | 640×360 / 8     | ~116 s  | `bistro_cafe_quick.exr`       |
+| `bistro/bistro_cafe_quick.pbrt` | 640×360 / 8     | ~28 s   | `bistro_cafe_quick.exr`       |
 
 \* The 481 s for the full 1080p/256spp is ~110 s fixed startup + ~370 s of
 actual 256-spp sample time. The ~110 s fixed startup is the `gpu-build+upload+bvh`
@@ -82,6 +107,80 @@ were found and fixed while getting it to build and run:
   i.e. the deferred upload now runs at parity with the synchronous baseline (the
   upload stage is small; the ~110 s is OptiX BVH build, which dominates and is
   unchanged). `bistro_cafe_quick.exr` renders correctly.
+
+## OptiX front-end optimization (P0–P4)
+
+After the deferred-upload fix restored parity (~117 s), phase instrumentation
+revealed the ~110 s startup was **not** the OptiX GPU build (≈0.2 s) but
+CPU-side per-mesh geometry upload + scene/texture construction. Plan executed:
+
+- **P0 — instrumentation (done).** `STAGE_TIMING` phase timers in
+  `aggregate.cpp` and `textures.cpp`. Essential: located the real bottleneck.
+- **P1 — bulk geometry upload (done, main win).** In `buildBVHForTriangles`
+  (`gpu/optix/aggregate.cpp`) the old code did one `cudaMalloc` + `cudaMemcpy`
+  per mesh (1591 meshes → 3182 allocations, **58 s**). Replaced with: gather
+  all vertex/index data into two host staging buffers, then one `cudaMalloc` +
+  one `cudaMemcpy` per buffer (2 allocations total, **0.06 s**). Vertex offset
+  per mesh aligned to 16 B for OptiX. Byte-identical output (verified by EXR
+  pixel diff vs. committed reference — only 4 EXR-header bytes differ, which are
+  non-deterministic metadata).
+- **P4 — SBT header precompute (done).** The 3 SBT record headers depend only
+  on the program group, so they are packed once and `memcpy`'d into each record
+  instead of calling `optixSbtRecordPackHeader` 3× per mesh (4773 OptiX API
+  calls). Shaves ~2.7 s off the flatten; output pixel-identical.
+- **P2 — parallelize builds / overlap upload (not beneficial, left as-is).**
+  The 3 top-level GAS builds are already coded with `RunAsync`, but on Windows
+  `DisableThreadPool()` is required (GPU managed-memory constraint, Issue #164)
+  so they run serially and cannot be safely re-enabled. Texture upload is
+  already Taskflow-parallel. With the geometry/OptiX stage now only ~4 s, there
+  is nothing left to overlap.
+- **P3 — build flags / compaction (not beneficial, left as-is).** The OptiX
+  `optixAccelBuild` is ~0.25 s; compaction would not move the needle.
+
+**Remaining bottleneck** (the next target, not yet optimized): the texture
+pipeline — `wpi-pre-flush` (image read/decode in `CreateTextures`, ~13.7 s) +
+`texture-upload` (~9.6 s) + `wpi-post-flush` (light preprocess / LightSampler /
+queue allocation, ~10 s). These are I/O + GPU-bandwidth + CPU scene-processing
+costs and overlap with the in-progress deferred-upload feature
+(`util/image.cpp` mmap reads, `util/parallel_tasks.*` Taskflow glue), so they
+were left for a follow-up rather than riskily refactored.
+
+All `STAGE_TIMING` prints remain in the code (cheap, useful for re-measuring);
+they can be gated behind a flag or removed for a clean PR.
+
+## Texture pipeline overlap (improvement 1)
+
+After P0–P4, the dominant remaining cost is the texture pipeline. Finer phase
+instrumentation of the `WavefrontPathIntegrator` ctor shows, for
+`bistro_cafe_quick`:
+
+- `wpi-CreateTextures` ≈ 12 s — builds the deferred texture *objects* (one per
+  texture reference; the GPU `Create` functions only register a pending upload
+  and do **not** read image files). Scene-graph construction overhead, not I/O.
+- `texture-upload` ≈ 10 s — `FlushGPUTextureUploads()` runs `DoGPUTextureUpload`
+  per unique texture on a Taskflow executor (already parallel across the 147
+  textures). Each task does `Image::Read` (decode) + MIPMap +
+  `cudaMallocMipmappedArray` + per-level `cudaMemcpy2DToArray`.
+- `wpi-post-flush` ≈ 14 s — light Preprocess / LightSampler / queue allocation.
+
+**Change applied:** `FlushGPUTextureUploads()` is launched on a background
+`std::thread` right after `CreateTextures` builds the pending-upload list, and
+`join()`ed at the end of the `WavefrontPathIntegrator` ctor. This overlaps the
+(~10 s) texture upload with `OptiXAggregate` construction (~4–12 s, varies) and
+the rest of scene setup. The upload target is device memory (not managed), so
+it does not violate the `DisableThreadPool` constraint; the join guarantees all
+`texObj`s are set before `Render()`.
+
+**Result:** `gpu-build+upload+bvh` ≈ 24–27 s (was ~27–28 s); output remains
+pixel-identical to the committed reference (only 4 non-deterministic EXR-header
+bytes differ). The measured saving (~2–3 s) is within run-to-run variance on
+this machine because the upload's CPU decode and the OptiX build's CPU flatten
+contend for the same cores; the change is structurally beneficial and helps
+more where there is spare CPU/GPU headroom.
+
+The dominant *unaddressed* cost is `wpi-CreateTextures` (~12 s) — texture
+object instantiation per reference — which is scene-graph construction, not the
+I/O/upload pipeline.
 
 ## How to render
 

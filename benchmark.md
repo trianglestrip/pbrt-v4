@@ -279,6 +279,14 @@ Retained from this investigation:
   latent crash/corruption hazard independent of this feature.
 - `Printf` flushes stdout per line, so `STAGE_TIMING` progress survives crashes.
 
+**Verification note:** because the OpenEXR deflate implementation changed,
+rendered `.exr` files are no longer byte-identical to older references (the
+container's compressed streams differ). Correctness must be checked at the
+pixel level, e.g.
+`imgtool diff --metric MAE --reference old.exr new.exr`
+(silent exit 0 == `error.MaxValue()==0` == identical pixels). Verified:
+post-revert renders are pixel-identical to the pre-change reference.
+
 Note on measurements taken late in this session: with the host at 0 GB free,
 wall times balloon 4–8× across *all* phases (even driver-only `optix-init`);
 such runs are not comparable to the baselines above.

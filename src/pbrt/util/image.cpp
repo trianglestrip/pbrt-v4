@@ -20,6 +20,7 @@
 #include <lodepng/lodepng.h>
 
 #ifndef PBRT_IS_GPU_CODE
+#include <IexBaseExc.h>
 // Work around conflict with "half".
 #include <ImfChannelList.h>
 #include <ImfChromaticitiesAttribute.h>
@@ -28,6 +29,7 @@
 #include <ImfHeader.h>
 #include <ImfInputFile.h>
 #include <ImfIntAttribute.h>
+#include <ImfIO.h>
 #include <ImfMatrixAttribute.h>
 #include <ImfOutputFile.h>
 #include <ImfStringAttribute.h>
@@ -36,7 +38,14 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <fstream>
 #include <numeric>
+#include <stdexcept>
+#include <string>
+#include <vector>
 
 // use lodepng and get 16-bit.
 #define STBI_NO_PNG
@@ -49,6 +58,20 @@
 #define QOI_NO_STDIO
 #define QOI_IMPLEMENTATION
 #include <qoi/qoi.h>
+
+#ifdef PBRT_IS_WINDOWS
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+// Stop that, Windows.
+#ifdef RGB
+#undef RGB
+#endif
+#endif  // PBRT_IS_WINDOWS
 
 namespace pbrt {
 
@@ -865,6 +888,123 @@ Image Image::JointBilateralFilter(const ImageChannelDesc &toFilterDesc, int half
     return result;
 }
 
+///////////////////////////////////////////////////////////////////////////
+// Memory-mapped file support
+
+// RAII view over a memory-mapped file (Windows) or heap copy (other
+// platforms).
+class MappedFile {
+  public:
+    explicit MappedFile(const std::string &filename) {
+#ifdef PBRT_IS_WINDOWS
+        hFile = CreateFileW(WStringFromUTF8(filename).c_str(), GENERIC_READ,
+                            FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (hFile == INVALID_HANDLE_VALUE)
+            return;
+
+        LARGE_INTEGER fileSize;
+        if (!GetFileSizeEx(hFile, &fileSize) || fileSize.QuadPart < 0) {
+            CloseHandle(hFile);
+            hFile = INVALID_HANDLE_VALUE;
+            return;
+        }
+        sizeBytes = size_t(fileSize.QuadPart);
+
+        if (sizeBytes == 0) {
+            // Zero-length files can't be mapped, but there's nothing to
+            // read from them anyway; report success with a null pointer.
+            CloseHandle(hFile);
+            hFile = INVALID_HANDLE_VALUE;
+            ok_ = true;
+            return;
+        }
+
+        hMapping = CreateFileMappingW(hFile, nullptr, PAGE_READONLY, 0, 0, nullptr);
+        if (hMapping == nullptr) {
+            CloseHandle(hFile);
+            hFile = INVALID_HANDLE_VALUE;
+            sizeBytes = 0;
+            return;
+        }
+
+        mappedBytes = (const uint8_t *)MapViewOfFile(hMapping, FILE_MAP_READ, 0, 0, 0);
+        if (mappedBytes == nullptr) {
+            CloseHandle(hMapping);
+            hMapping = nullptr;
+            CloseHandle(hFile);
+            hFile = INVALID_HANDLE_VALUE;
+            sizeBytes = 0;
+            return;
+        }
+        ok_ = true;
+#else
+        std::ifstream ifs(filename, std::ios::binary);
+        if (!ifs)
+            return;
+
+        ifs.seekg(0, std::ios::end);
+        std::streamoff length = ifs.tellg();
+        if (length <= 0) {
+            // Match the Windows behavior of treating an empty file as
+            // valid but empty.
+            ok_ = (length == 0);
+            return;
+        }
+
+        contents.resize(size_t(length));
+        ifs.seekg(0, std::ios::beg);
+        ifs.read((char *)contents.data(), length);
+        if (!ifs) {
+            contents.clear();
+            sizeBytes = 0;
+            return;
+        }
+
+        sizeBytes = contents.size();
+        ok_ = true;
+#endif
+    }
+
+    ~MappedFile() {
+#ifdef PBRT_IS_WINDOWS
+        if (mappedBytes != nullptr)
+            UnmapViewOfFile(mappedBytes);
+        if (hMapping != nullptr)
+            CloseHandle(hMapping);
+        if (hFile != INVALID_HANDLE_VALUE)
+            CloseHandle(hFile);
+#endif
+    }
+
+    MappedFile(const MappedFile &) = delete;
+    MappedFile &operator=(const MappedFile &) = delete;
+
+    bool ok() const { return ok_; }
+
+    // Returns nullptr for a valid-but-empty (zero byte) file.
+    const uint8_t *data() const {
+#ifdef PBRT_IS_WINDOWS
+        return mappedBytes;
+#else
+        return contents.data();
+#endif
+    }
+
+    size_t size() const { return sizeBytes; }
+
+  private:
+    bool ok_ = false;
+    size_t sizeBytes = 0;
+#ifdef PBRT_IS_WINDOWS
+    HANDLE hFile = INVALID_HANDLE_VALUE;
+    HANDLE hMapping = nullptr;
+    const uint8_t *mappedBytes = nullptr;
+#else
+    std::vector<uint8_t> contents;
+#endif
+};
+
 // ImageIO Local Declarations
 static ImageAndMetadata ReadEXR(const std::string &name, Allocator alloc);
 static ImageAndMetadata ReadPNG(const std::string &name, Allocator alloc,
@@ -887,7 +1027,14 @@ ImageAndMetadata Image::Read(std::string name, Allocator alloc, ColorEncoding en
         return ReadQOI(name, alloc);
     else {
         int x, y, n;
-        unsigned char *data = stbi_load(name.c_str(), &x, &y, &n, 0);
+        unsigned char *data;
+        {
+            MappedFile mappedFile(name);
+            if (!mappedFile.ok())
+                ErrorExit("%s: no support for reading images with this extension", name);
+            data = stbi_load_from_memory(mappedFile.data(), int(mappedFile.size()), &x,
+                                         &y, &n, 0);
+        }
         if (data) {
             pstd::vector<uint8_t> pixels(data, data + x * y * n, alloc);
             stbi_image_free(data);
@@ -1052,9 +1199,55 @@ static Imf::FrameBuffer imageToFrameBuffer(const Image &image,
     return fb;
 }
 
+// Implementation of Imf::IStream that reads from a contiguous buffer in
+// memory (e.g., a MappedFile view).
+class MemoryIStream : public Imf::IStream {
+  public:
+    MemoryIStream(const char *filename, const uint8_t *data, size_t size)
+        : Imf::IStream(filename), buf(data), len(uint64_t(size)), pos(0) {}
+
+    bool isMemoryMapped() const override { return true; }
+
+    bool read(char c[], int n) override {
+        if (n < 0 || pos + uint64_t(n) > len)
+            throw Iex::InputExc("Unexpected end of file.");
+        memcpy(c, buf + pos, size_t(n));
+        pos += uint64_t(n);
+        // Return false once the last byte of the file has been read.
+        return pos != len;
+    }
+
+    char *readMemoryMapped(int n) override {
+        if (n < 0 || pos + uint64_t(n) > len)
+            throw Iex::InputExc("Unexpected end of file.");
+        char *ret = (char *)(buf + pos);
+        pos += uint64_t(n);
+        return ret;
+    }
+
+    uint64_t tellg() override { return pos; }
+
+    void seekg(uint64_t p) override {
+        if (p > len)
+            throw Iex::InputExc("Seek past end of file.");
+        pos = p;
+    }
+
+    int64_t size() override { return int64_t(len); }
+
+  private:
+    const uint8_t *buf;
+    uint64_t len, pos;
+};
+
 static ImageAndMetadata ReadEXR(const std::string &name, Allocator alloc) {
     try {
-        Imf::InputFile file(name.c_str());
+        MappedFile mappedFile(name);
+        if (!mappedFile.ok())
+            throw std::runtime_error("unable to open file");
+
+        MemoryIStream istream(name.c_str(), mappedFile.data(), mappedFile.size());
+        Imf::InputFile file(istream);
         Imath::Box2i dw = file.header().dataWindow();
 
         ImageMetadata metadata;
@@ -1259,7 +1452,9 @@ bool Image::WriteEXR(const std::string &name, const ImageMetadata &metadata) con
 
 static ImageAndMetadata ReadPNG(const std::string &name, Allocator alloc,
                                 ColorEncoding encoding) {
-    std::string contents = ReadFileContents(name);
+    MappedFile mappedFile(name);
+    if (!mappedFile.ok())
+        ErrorExit("%s: %s", name, ErrorString());
 
     if (!encoding)
         encoding = ColorEncoding::sRGB;
@@ -1267,8 +1462,8 @@ static ImageAndMetadata ReadPNG(const std::string &name, Allocator alloc,
     unsigned width, height;
     LodePNGState state;
     lodepng_state_init(&state);
-    unsigned int error = lodepng_inspect(
-        &width, &height, &state, (const unsigned char *)contents.data(), contents.size());
+    unsigned int error =
+        lodepng_inspect(&width, &height, &state, mappedFile.data(), mappedFile.size());
     if (error != 0)
         ErrorExit("%s: %s", name, lodepng_error_text(error));
 
@@ -1278,9 +1473,8 @@ static ImageAndMetadata ReadPNG(const std::string &name, Allocator alloc,
     case LCT_GREY_ALPHA: {
         std::vector<unsigned char> buf;
         int bpp = state.info_png.color.bitdepth == 16 ? 16 : 8;
-        error =
-            lodepng::decode(buf, width, height, (const unsigned char *)contents.data(),
-                            contents.size(), LCT_GREY, bpp);
+        error = lodepng::decode(buf, width, height, mappedFile.data(), mappedFile.size(),
+                                LCT_GREY, bpp);
         if (error != 0)
             ErrorExit("%s: %s", name, lodepng_error_text(error));
 
@@ -1306,9 +1500,8 @@ static ImageAndMetadata ReadPNG(const std::string &name, Allocator alloc,
         int bpp = state.info_png.color.bitdepth == 16 ? 16 : 8;
         bool hasAlpha = (state.info_png.color.colortype == LCT_RGBA);
         // Force RGB if it's paletted or whatever.
-        error =
-            lodepng::decode(buf, width, height, (const unsigned char *)contents.data(),
-                            contents.size(), hasAlpha ? LCT_RGBA : LCT_RGB, bpp);
+        error = lodepng::decode(buf, width, height, mappedFile.data(),
+                                mappedFile.size(), hasAlpha ? LCT_RGBA : LCT_RGB, bpp);
         if (error != 0)
             ErrorExit("%s: %s", name, lodepng_error_text(error));
 
@@ -1584,11 +1777,35 @@ static inline int isWhitespace(char c) {
     return static_cast<int>(c == ' ' || c == '\n' || c == '\t');
 }
 
-// Reads a "word" from the fp and puts it into buffer and adds a null
+// Simple cursor over the bytes of a MappedFile that mimics sequential
+// buffered reads from a FILE *, returning EOF at the end of the buffer.
+struct MemFileCursor {
+    MemFileCursor(const uint8_t *start, const uint8_t *stop)
+        : ptr(start), end(stop) {}
+
+    MemFileCursor(const uint8_t *start, size_t size)
+        : ptr(start), end(start + size) {}
+
+    int nextChar() {
+        return ptr < end ? int(*ptr++) : EOF;
+    }
+
+    bool readBytes(void *dest, size_t n) {
+        if (size_t(end - ptr) < n)
+            return false;
+        memcpy(dest, ptr, n);
+        ptr += n;
+        return true;
+    }
+
+    const uint8_t *ptr, *end;
+};
+
+// Reads a "word" from the cursor and puts it into buffer and adds a null
 // terminator.  i.e. it keeps reading until whitespace is reached.  Returns
 // the number of characters read *not* including the whitespace, and
 // returns -1 on an error.
-static int readWord(FILE *fp, char *buffer, int bufferLength) {
+static int readWord(MemFileCursor &file, char *buffer, int bufferLength) {
     int n;
     int c;
 
@@ -1596,11 +1813,11 @@ static int readWord(FILE *fp, char *buffer, int bufferLength) {
         return -1;
 
     n = 0;
-    c = fgetc(fp);
+    c = file.nextChar();
     while (c != EOF && (isWhitespace(c) == 0) && n < bufferLength) {
         buffer[n] = c;
         ++n;
-        c = fgetc(fp);
+        c = file.nextChar();
     }
 
     if (n < bufferLength) {
@@ -1620,12 +1837,14 @@ static ImageAndMetadata ReadPFM(const std::string &filename, Allocator alloc) {
     bool fileLittleEndian;
     ImageMetadata metadata;
 
-    FILE *fp = FOpenRead(filename);
-    if (!fp)
+    MappedFile mappedFile(filename);
+    if (!mappedFile.ok())
         ErrorExit("%s: unable to open PFM file", filename);
 
+    MemFileCursor file(mappedFile.data(), mappedFile.size());
+
     // read either "Pf" or "PF"
-    if (readWord(fp, buffer, BUFFER_SIZE) == -1)
+    if (readWord(file, buffer, BUFFER_SIZE) == -1)
         ErrorExit("%s: unable to read PFM file", filename);
 
     if (strcmp(buffer, "Pf") == 0)
@@ -1638,19 +1857,19 @@ static ImageAndMetadata ReadPFM(const std::string &filename, Allocator alloc) {
 
     // read the rest of the header
     // read width
-    if (readWord(fp, buffer, BUFFER_SIZE) == -1)
+    if (readWord(file, buffer, BUFFER_SIZE) == -1)
         goto fail;
     if (!Atoi(buffer, &width))
         ErrorExit("%s: unable to decode width \"%s\"", filename, buffer);
 
     // read height
-    if (readWord(fp, buffer, BUFFER_SIZE) == -1)
+    if (readWord(file, buffer, BUFFER_SIZE) == -1)
         goto fail;
     if (!Atoi(buffer, &height))
         ErrorExit("%s: unable to decode height \"%s\"", filename, buffer);
 
     // read scale
-    if (readWord(fp, buffer, BUFFER_SIZE) == -1)
+    if (readWord(file, buffer, BUFFER_SIZE) == -1)
         goto fail;
     if (!Atof(buffer, &scale))
         ErrorExit("%s: unable to decode scale \"%s\"", filename, buffer);
@@ -1659,8 +1878,8 @@ static ImageAndMetadata ReadPFM(const std::string &filename, Allocator alloc) {
     nFloats = nChannels * size_t(width) * size_t(height);
     rgb32.resize(nFloats);
     for (int y = height - 1; y >= 0; --y)
-        if (fread(&rgb32[nChannels * y * width], sizeof(float), nChannels * width, fp) !=
-            nChannels * width)
+        if (!file.readBytes(&rgb32[nChannels * y * width],
+                            sizeof(float) * size_t(nChannels * width)))
             goto fail;
 
     // apply endian conversian and scale if appropriate
@@ -1678,7 +1897,6 @@ static ImageAndMetadata ReadPFM(const std::string &filename, Allocator alloc) {
         for (unsigned int i = 0; i < nFloats; ++i)
             rgb32[i] *= std::abs(scale);
 
-    fclose(fp);
     LOG_VERBOSE("Read PFM image %s (%d x %d)", filename, width, height);
     metadata.colorSpace = RGBColorSpace::sRGB;
     if (nChannels == 1)
@@ -1689,14 +1907,22 @@ static ImageAndMetadata ReadPFM(const std::string &filename, Allocator alloc) {
                                 metadata};
 
 fail:
-    if (fp)
-        fclose(fp);
     ErrorExit("%s: premature end of file in PFM file", filename);
 }
 
 static ImageAndMetadata ReadHDR(const std::string &filename, Allocator alloc) {
     int x, y, n;
-    float *data = stbi_loadf(filename.c_str(), &x, &y, &n, 0);
+    float *data;
+    {
+        MappedFile mappedFile(filename);
+        if (mappedFile.ok())
+            data = stbi_loadf_from_memory(mappedFile.data(), int(mappedFile.size()), &x,
+                                          &y, &n, 0);
+        else
+            // Fall back so that stbi_failure_reason() reports the problem
+            // in the error check below.
+            data = stbi_loadf(filename.c_str(), &x, &y, &n, 0);
+    }
     if (!data)
         ErrorExit("%s: %s", filename, stbi_failure_reason());
 
@@ -1725,9 +1951,13 @@ static ImageAndMetadata ReadHDR(const std::string &filename, Allocator alloc) {
 }
 
 static ImageAndMetadata ReadQOI(const std::string &filename, Allocator alloc) {
-    std::string contents = ReadFileContents(filename);
+    MappedFile mappedFile(filename);
+    if (!mappedFile.ok())
+        ErrorExit("%s: %s", filename, ErrorString());
+
     qoi_desc desc;
-    void *pixels = qoi_decode(contents.data(), contents.size(), &desc, 0 /* channels */);
+    void *pixels =
+        qoi_decode(mappedFile.data(), int(mappedFile.size()), &desc, 0 /* channels */);
     CHECK(pixels != nullptr);  // qoi failure
 
     ImageMetadata metadata;

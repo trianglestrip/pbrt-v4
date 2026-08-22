@@ -1,0 +1,20 @@
+Film "rgb" "integer xresolution" [32] "integer yresolution" [32]
+Camera "perspective" "float fov" [50]
+    "float lensradius" [0] "float focaldistance" [0]
+
+Sampler "stratified" "integer xsamples" [2] "integer ysamples" [2]
+Integrator "path" "integer maxdepth" [3]
+
+PixelFilter "box"
+
+WorldBegin
+
+LightSource "infinite" "rgb L" [3 3 3]
+
+AttributeBegin
+    Rotate 90 1 0 0
+    Material "diffuse" "rgb reflectance" [0.8 0.8 0.8]
+    Shape "sphere" "float radius" [1]
+AttributeEnd
+
+WorldEnd

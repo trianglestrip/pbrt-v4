@@ -56,6 +56,33 @@ Taskflow-parallel upload.
 actual 256-spp sample time. The ~110 s fixed startup is the `gpu-build+upload+bvh`
 stage above and is constant regardless of spp.
 
+### Deferred GPU texture upload — implementation & fix
+
+The parallel upload is implemented in `textures.cpp` (`FlushGPUTextureUploads` +
+`DoGPUTextureUpload`), fed by memory-mapped image reads in `util/image.cpp`, with the
+Taskflow glue in `util/parallel_tasks.*` and `gpu/gpu_texture_upload.h`. Two bugs
+were found and fixed while getting it to build and run:
+
+- **Crash (std::terminate):** `GPUSpectrumImageTexture::Create` /
+  `GPUFloatImageTexture::Create` locked `textureCacheMutex` but returned early on the
+  deferred-upload path without unlocking; the next texture creation on the same worker
+  thread re-locked the held non-recursive mutex → `std::mutex::lock()` threw
+  `std::system_error` → `terminate`. Fixed by unlocking before the early return.
+- **~4× slowdown regression:** pending uploads were registered per texture *instance*
+  with no de-duplication, and `DoGPUTextureUpload`'s cache check raced with its insert,
+  so the same file was uploaded many times. Fixed by coalescing pending uploads by
+  `(filename, type)` so each unique texture is uploaded exactly once.
+
+  Measured after the fix (`bistro_cafe_quick.pbrt`, same machine):
+  ```
+  STAGE_TIMING [parse]                0.26 s
+  STAGE_TIMING [gpu-build+upload+bvh] 117.81 s
+  STAGE_TIMING [render-total]         118.24 s
+  ```
+  i.e. the deferred upload now runs at parity with the synchronous baseline (the
+  upload stage is small; the ~110 s is OptiX BVH build, which dominates and is
+  unchanged). `bistro_cafe_quick.exr` renders correctly.
+
 ## How to render
 
 ```bat

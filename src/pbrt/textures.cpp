@@ -15,6 +15,7 @@
 #include <pbrt/util/file.h>
 #include <pbrt/util/float.h>
 #include <pbrt/util/print.h>
+#include <pbrt/util/parallel_tasks.h>
 #include <pbrt/util/splines.h>
 #include <pbrt/util/stats.h>
 
@@ -989,6 +990,91 @@ WrinkledTexture *WrinkledTexture::Create(const Transform &renderFromTexture,
 
 #if defined(PBRT_BUILD_GPU_RENDERER)
 
+// ---------------------------------------------------------------------------
+// Deferred, Taskflow-parallel GPU texture upload.
+//
+// The GPU image-texture upload (file read -> decode -> MIP map -> cudaMalloc +
+// cudaMemcpy + cudaCreateTextureObject) is otherwise done serially, interleaved
+// with scene construction.  Instead we register each upload as a pending task
+// during scene construction and flush them all in parallel with a Taskflow graph
+// once the scene's textures/materials are known.  Image file reads use a
+// memory-mapped view (see Image::Read) to avoid an extra copy from disk.
+// ---------------------------------------------------------------------------
+struct GPUTextureUploadResult {
+    cudaTextureObject_t texObj = 0;
+    bool isSingleChannel = false;
+    const RGBColorSpace *colorSpace = nullptr;
+};
+
+struct PendingGPUTextureUpload {
+    std::string filename;
+    ColorEncoding encoding;
+    std::string wrapString, filter;
+    Float maxAniso, scale;
+    bool invert;
+    bool isSpectrum;
+    SpectrumType spectrumType;
+    const FileLoc *loc;
+    // All texture objects that reference this file share the single upload's
+    // result (one GPU upload per unique filename, not per texture instance).
+    std::vector<GPUSpectrumImageTexture *> spectrumTexes;
+    std::vector<GPUFloatImageTexture *> floatTexes;
+};
+
+static std::vector<PendingGPUTextureUpload> pendingGPUTextureUploads;
+static std::mutex pendingUploadMutex;
+// filename -> index into pendingGPUTextureUploads for an in-flight upload,
+// used to coalesce multiple texture instances of the same file.
+static std::map<std::string, size_t> pendingUploadsByName;
+
+// Performs the cache-miss upload (decode + MIP map + cudaMalloc + cudaMemcpy +
+// cudaCreateTextureObject) for one texture, inserting the result into the texture
+// caches.  Mirrors the former inline logic in the *::Create methods.
+static GPUTextureUploadResult DoGPUTextureUpload(const PendingGPUTextureUpload &task);
+
+// Registers a pending upload, returning its index in pendingGPUTextureUploads.
+// Callers must hold textureCacheMutex so pendingUploadsByName stays consistent.
+static size_t RegisterPendingGPUTextureUpload(PendingGPUTextureUpload task) {
+    std::lock_guard<std::mutex> lock(pendingUploadMutex);
+    pendingGPUTextureUploads.push_back(std::move(task));
+    return pendingGPUTextureUploads.size() - 1;
+}
+
+// Runs all pending texture uploads in parallel via a Taskflow graph.  Must be
+// called (once) after all scene textures/materials are created and before the
+// OptiX acceleration structure is built / rendering starts.  Declared in
+// <pbrt/gpu/gpu_texture_upload.h>.
+void FlushGPUTextureUploads() {
+    std::vector<PendingGPUTextureUpload> tasks;
+    {
+        std::lock_guard<std::mutex> lock(pendingUploadMutex);
+        tasks = std::move(pendingGPUTextureUploads);
+        pendingGPUTextureUploads.clear();
+        pendingUploadsByName.clear();
+    }
+    if (tasks.empty())
+        return;
+
+    std::vector<std::function<void()>> closures;
+    closures.reserve(tasks.size());
+    for (auto &task : tasks) {
+        // Capture by value: each closure owns its PendingGPUTextureUpload
+        // (including the list of all texture instances that share it).
+        closures.emplace_back([task]() {
+            GPUTextureUploadResult result = DoGPUTextureUpload(task);
+            for (auto *t : task.spectrumTexes) {
+                t->texObj = result.texObj;
+                t->isSingleChannel = result.isSingleChannel;
+                t->colorSpace = result.colorSpace;
+            }
+            for (auto *t : task.floatTexes) {
+                t->texObj = result.texObj;
+            }
+        });
+    }
+    RunParallelTasks(std::move(closures));
+}
+
 struct LuminanceTextureCacheItem {
     cudaMipmappedArray_t mipArray;
     cudaTextureReadMode readMode;
@@ -1003,13 +1089,15 @@ struct RGBTextureCacheItem {
     const RGBColorSpace *colorSpace;
 };
 
-static std::mutex textureCacheMutex;
-static std::map<std::string, LuminanceTextureCacheItem> lumTextureCache;
-static std::map<std::string, RGBTextureCacheItem> rgbTextureCache;
+// These are exposed (non-static) so gpu_texture_upload.cpp can consult/update
+// the caches from the parallel upload path.
+std::mutex textureCacheMutex;
+std::map<std::string, LuminanceTextureCacheItem> lumTextureCache;
+std::map<std::string, RGBTextureCacheItem> rgbTextureCache;
 
 STAT_MEMORY_COUNTER("Memory/ImageTextures", gpuImageTextureBytes);
 
-static cudaMipmappedArray_t createSingleChannelTextureArray(
+cudaMipmappedArray_t createSingleChannelTextureArray(
     const Image &image, const RGBColorSpace *colorSpace, int *nMIPMapLevels) {
     CHECK_EQ(1, image.NChannels());
     cudaMipmappedArray_t mipArray;
@@ -1069,7 +1157,7 @@ static cudaMipmappedArray_t createSingleChannelTextureArray(
     return mipArray;
 }
 
-static cudaTextureAddressMode convertAddressMode(const std::string &mode) {
+cudaTextureAddressMode convertAddressMode(const std::string &mode) {
     if (mode == "repeat")
         return cudaAddressModeWrap;
     else if (mode == "clamp")
@@ -1078,6 +1166,326 @@ static cudaTextureAddressMode convertAddressMode(const std::string &mode) {
         return cudaAddressModeBorder;
     else
         ErrorExit("%s: texture wrap mode not supported", mode);
+}
+
+// Shared tail of the GPU image-texture upload: creates the CUDA texture
+// object for an already-uploaded mipmapped array.
+static cudaTextureObject_t MakeGPUTextureObject(cudaMipmappedArray_t mipArray,
+                                                const std::string &wrapString,
+                                                const std::string &filter,
+                                                Float maxAniso, int nLevels,
+                                                cudaTextureReadMode readMode) {
+    cudaResourceDesc resDesc = {};
+    resDesc.resType = cudaResourceTypeMipmappedArray;
+    resDesc.res.mipmap.mipmap = mipArray;
+
+    cudaTextureDesc texDesc = {};
+    texDesc.addressMode[0] = convertAddressMode(wrapString);
+    texDesc.addressMode[1] = convertAddressMode(wrapString);
+    texDesc.filterMode = filter == "point" ? cudaFilterModePoint : cudaFilterModeLinear;
+    texDesc.readMode = readMode;
+    texDesc.normalizedCoords = 1;
+    texDesc.maxAnisotropy = Clamp(maxAniso, 1, 16);
+    texDesc.maxMipmapLevelClamp = nLevels - 1;
+    texDesc.minMipmapLevelClamp = 0;
+    texDesc.mipmapFilterMode =
+        (filter == "trilinear" || filter == "ewa" || filter == "EWA")
+            ? cudaFilterModeLinear
+            : cudaFilterModePoint;
+    texDesc.borderColor[0] = texDesc.borderColor[1] = texDesc.borderColor[2] =
+        texDesc.borderColor[3] = 0.f;
+    texDesc.sRGB = 1;
+
+    cudaTextureObject_t texObj;
+    CUDA_CHECK(cudaCreateTextureObject(&texObj, &resDesc, &texDesc, nullptr));
+    return texObj;
+}
+
+// Performs the deferred GPU texture upload for one pending task: re-checks the
+// texture caches (a parallel task may have uploaded the same file already),
+// otherwise decodes the image, builds the MIP map, allocates and uploads the
+// CUDA mipmapped array, inserts the result into the appropriate cache, and
+// creates the CUDA texture object.
+static GPUTextureUploadResult DoGPUTextureUpload(const PendingGPUTextureUpload &task) {
+    GPUTextureUploadResult result;
+    const std::string &filename = task.filename;
+
+    if (task.isSpectrum) {
+        cudaMipmappedArray_t mipArray;
+        int nMIPMapLevels = 0;
+        cudaTextureReadMode readMode;
+        const RGBColorSpace *colorSpace = nullptr;
+
+        // Re-check both caches under the lock: another parallel task may have
+        // uploaded this filename in the meantime.
+        textureCacheMutex.lock();
+        auto rgbIter = rgbTextureCache.find(filename);
+        if (rgbIter != rgbTextureCache.end()) {
+            LOG_VERBOSE("Found %s in RGB tex array cache!", filename);
+            mipArray = rgbIter->second.mipArray;
+            readMode = rgbIter->second.readMode;
+            nMIPMapLevels = rgbIter->second.nMIPMapLevels;
+            colorSpace = rgbIter->second.colorSpace;
+            textureCacheMutex.unlock();
+
+            result.texObj = MakeGPUTextureObject(mipArray, task.wrapString, task.filter,
+                                                 task.maxAniso, nMIPMapLevels, readMode);
+            result.isSingleChannel = false;
+            result.colorSpace = colorSpace;
+            return result;
+        }
+        auto lumIter = lumTextureCache.find(filename);
+        // We don't want to take it if it was originally an RGB texture and
+        // GPUFloatImageTexture converted it to single channel
+        if (lumIter != lumTextureCache.end() && lumIter->second.originallySingleChannel) {
+            LOG_VERBOSE("Found %s in luminance tex array cache!", filename);
+            mipArray = lumIter->second.mipArray;
+            readMode = lumIter->second.readMode;
+            nMIPMapLevels = lumIter->second.nMIPMapLevels;
+            textureCacheMutex.unlock();
+
+            result.texObj = MakeGPUTextureObject(mipArray, task.wrapString, task.filter,
+                                                 task.maxAniso, nMIPMapLevels, readMode);
+            result.isSingleChannel = true;
+            result.colorSpace = RGBColorSpace::sRGB;
+            return result;
+        }
+        textureCacheMutex.unlock();
+
+        // Cache miss: perform the full upload.
+        ImageAndMetadata immeta = Image::Read(filename);
+        Image &image = immeta.image;
+
+        readMode = image.Format() == PixelFormat::U256 ? cudaReadModeNormalizedFloat
+                                                       : cudaReadModeElementType;
+        colorSpace = immeta.metadata.GetColorSpace();
+
+        ImageChannelDesc rgbDesc = image.GetChannelDesc({"R", "G", "B"});
+        if (rgbDesc) {
+            image = image.SelectChannels(rgbDesc);
+
+            MIPMap mipmap(image, colorSpace, WrapMode::Clamp /* TODO */,
+                          Allocator(), MIPMapFilterOptions());
+            nMIPMapLevels = mipmap.Levels();
+            const Image &baseImage = mipmap.GetLevel(0);
+
+            switch (image.Format()) {
+            case PixelFormat::U256: {
+                cudaChannelFormatDesc channelDesc = cudaCreateChannelDesc(
+                    8, 8, 8, 8, cudaChannelFormatKindUnsigned);
+
+                cudaExtent extent = make_cudaExtent(baseImage.Resolution().x,
+                                                    baseImage.Resolution().y, 0);
+                CUDA_CHECK(cudaMallocMipmappedArray(&mipArray, &channelDesc,
+                                                    extent, mipmap.Levels(),
+                                                    0 /* flags */));
+                for (int level = 0; level < mipmap.Levels(); ++level) {
+                    const Image &levelImage = mipmap.GetLevel(level);
+                    cudaArray_t levelArray;
+                    CUDA_CHECK(
+                        cudaGetMipmappedArrayLevel(&levelArray, mipArray, level));
+
+                    std::vector<uint8_t> rgba(4 * levelImage.Resolution().x *
+                                              levelImage.Resolution().y);
+                    size_t offset = 0;
+                    for (int y = 0; y < levelImage.Resolution().y; ++y)
+                        for (int x = 0; x < levelImage.Resolution().x; ++x) {
+                            for (int c = 0; c < 3; ++c)
+                                rgba[offset++] =
+                                    ((uint8_t *)levelImage.RawPointer({x, y}))[c];
+                            rgba[offset++] = 255;
+                        }
+
+                    int pitch = levelImage.Resolution().x * 4 * sizeof(uint8_t);
+                    gpuImageTextureBytes += pitch * levelImage.Resolution().y;
+
+                    CUDA_CHECK(cudaMemcpy2DToArray(
+                        levelArray,
+                        /* offset */ 0, 0, rgba.data(), pitch, pitch,
+                        levelImage.Resolution().y, cudaMemcpyHostToDevice));
+                }
+                break;
+            }
+            case PixelFormat::Half: {
+                cudaChannelFormatDesc channelDesc = cudaCreateChannelDesc(
+                    16, 16, 16, 16, cudaChannelFormatKindFloat);
+
+                cudaExtent extent = make_cudaExtent(baseImage.Resolution().x,
+                                                    baseImage.Resolution().y, 0);
+                CUDA_CHECK(cudaMallocMipmappedArray(&mipArray, &channelDesc,
+                                                    extent, mipmap.Levels(),
+                                                    0 /* flags */));
+
+                for (int level = 0; level < mipmap.Levels(); ++level) {
+                    const Image &levelImage = mipmap.GetLevel(level);
+                    cudaArray_t levelArray;
+                    CUDA_CHECK(
+                        cudaGetMipmappedArrayLevel(&levelArray, mipArray, level));
+
+                    std::vector<Half> rgba(4 * levelImage.Resolution().x *
+                                           levelImage.Resolution().y);
+
+                    size_t offset = 0;
+                    for (int y = 0; y < levelImage.Resolution().y; ++y)
+                        for (int x = 0; x < levelImage.Resolution().x; ++x) {
+                            for (int c = 0; c < 3; ++c)
+                                rgba[offset++] =
+                                    Half(levelImage.GetChannel({x, y}, c));
+                            rgba[offset++] = Half(1.f);
+                        }
+
+                    int pitch = levelImage.Resolution().x * 4 * sizeof(Half);
+                    gpuImageTextureBytes += pitch * levelImage.Resolution().y;
+
+                    CUDA_CHECK(cudaMemcpy2DToArray(
+                        levelArray,
+                        /* offset */ 0, 0, rgba.data(), pitch, pitch,
+                        levelImage.Resolution().y, cudaMemcpyHostToDevice));
+                }
+                break;
+            }
+            case PixelFormat::Float: {
+                cudaChannelFormatDesc channelDesc = cudaCreateChannelDesc(
+                    32, 32, 32, 32, cudaChannelFormatKindFloat);
+
+                cudaExtent extent = make_cudaExtent(baseImage.Resolution().x,
+                                                    baseImage.Resolution().y, 0);
+                CUDA_CHECK(cudaMallocMipmappedArray(&mipArray, &channelDesc,
+                                                    extent, mipmap.Levels(),
+                                                    0 /* flags */));
+
+                for (int level = 0; level < mipmap.Levels(); ++level) {
+                    const Image &levelImage = mipmap.GetLevel(level);
+                    cudaArray_t levelArray;
+                    CUDA_CHECK(
+                        cudaGetMipmappedArrayLevel(&levelArray, mipArray, level));
+
+                    std::vector<float> rgba(4 * levelImage.Resolution().x *
+                                            levelImage.Resolution().y);
+
+                    size_t offset = 0;
+                    for (int y = 0; y < levelImage.Resolution().y; ++y)
+                        for (int x = 0; x < levelImage.Resolution().x; ++x) {
+                            for (int c = 0; c < 3; ++c)
+                                rgba[offset++] = levelImage.GetChannel({x, y}, c);
+                            rgba[offset++] = 1.f;
+                        }
+
+                    int pitch = levelImage.Resolution().x * 4 * sizeof(float);
+                    gpuImageTextureBytes += pitch * levelImage.Resolution().y;
+
+                    CUDA_CHECK(cudaMemcpy2DToArray(
+                        levelArray,
+                        /* offset */ 0, 0, rgba.data(), pitch, pitch,
+                        levelImage.Resolution().y, cudaMemcpyHostToDevice));
+                }
+                break;
+            }
+            default:
+                LOG_FATAL("Unexpected PixelFormat");
+            }
+
+            textureCacheMutex.lock();
+            rgbTextureCache[filename] = RGBTextureCacheItem{
+                mipArray, readMode, nMIPMapLevels, colorSpace};
+            textureCacheMutex.unlock();
+        } else if (image.NChannels() == 1) {
+            mipArray = createSingleChannelTextureArray(image, colorSpace,
+                                                       &nMIPMapLevels);
+
+            textureCacheMutex.lock();
+            lumTextureCache[filename] = LuminanceTextureCacheItem{
+                mipArray, readMode, nMIPMapLevels, true};
+            textureCacheMutex.unlock();
+            result.isSingleChannel = true;
+        } else {
+            Warning(task.loc, "%s: unable to decipher image format", filename);
+            // Leave texObj == 0: sampling will yield black but rendering can
+            // proceed.
+            return result;
+        }
+
+        result.texObj = MakeGPUTextureObject(mipArray, task.wrapString, task.filter,
+                                             task.maxAniso, nMIPMapLevels, readMode);
+        result.colorSpace = colorSpace;
+        return result;
+    } else {
+        // Float texture: single-channel (luminance) upload.
+        cudaMipmappedArray_t mipArray;
+        int nMIPMapLevels = 0;
+        cudaTextureReadMode readMode;
+
+        // Re-check the luminance cache under the lock: another parallel task
+        // may have uploaded this filename in the meantime.
+        textureCacheMutex.lock();
+        auto iter = lumTextureCache.find(filename);
+        if (iter != lumTextureCache.end()) {
+            LOG_VERBOSE("Found %s in luminance tex array cache!", filename);
+            mipArray = iter->second.mipArray;
+            readMode = iter->second.readMode;
+            nMIPMapLevels = iter->second.nMIPMapLevels;
+            textureCacheMutex.unlock();
+
+            result.texObj = MakeGPUTextureObject(mipArray, task.wrapString, task.filter,
+                                                 task.maxAniso, nMIPMapLevels, readMode);
+            return result;
+        }
+        textureCacheMutex.unlock();
+
+        // Cache miss: convert multi-channel images to luminance and upload.
+        ImageAndMetadata immeta = Image::Read(filename);
+        Image &image = immeta.image;
+        const RGBColorSpace *colorSpace = immeta.metadata.GetColorSpace();
+
+        bool convertedImage = false;
+        if (image.NChannels() != 1) {
+            ImageChannelDesc rgbaDesc = image.GetChannelDesc({"R", "G", "B", "A"});
+            ImageChannelDesc rgbDesc = image.GetChannelDesc({"R", "G", "B"});
+            auto allOnes = [&]() {
+                for (int y = 0; y < image.Resolution().y; ++y)
+                    for (int x = 0; x < image.Resolution().x; ++x)
+                        if (image.GetChannels({x, y}, rgbaDesc)[3] != 1)
+                            return false;
+                return true;
+            };
+            if (rgbaDesc && !allOnes()) {
+                ImageChannelDesc alphaDesc = image.GetChannelDesc({"A"});
+                image = image.SelectChannels(alphaDesc);
+                convertedImage = true;
+            } else if (rgbDesc) {
+                // Convert to one channel
+                Image avgImage(image.Format(), image.Resolution(), {"Y"},
+                               image.Encoding());
+
+                for (int y = 0; y < image.Resolution().y; ++y)
+                    for (int x = 0; x < image.Resolution().x; ++x)
+                        avgImage.SetChannel({x, y}, 0,
+                                            image.GetChannels({x, y}, rgbDesc).Average());
+
+                image = std::move(avgImage);
+                convertedImage = true;
+            } else {
+                Warning(task.loc, "%s: %d channel image, without RGB channels.",
+                        filename, image.NChannels());
+                // Leave texObj == 0: sampling will yield black but rendering
+                // can proceed.
+                return result;
+            }
+        }
+
+        mipArray = createSingleChannelTextureArray(image, colorSpace, &nMIPMapLevels);
+        readMode = (image.Format() == PixelFormat::U256) ? cudaReadModeNormalizedFloat
+                                                         : cudaReadModeElementType;
+
+        textureCacheMutex.lock();
+        lumTextureCache[filename] =
+            LuminanceTextureCacheItem{mipArray, readMode, nMIPMapLevels, !convertedImage};
+        textureCacheMutex.unlock();
+
+        result.texObj = MakeGPUTextureObject(mipArray, task.wrapString, task.filter,
+                                             task.maxAniso, nMIPMapLevels, readMode);
+        return result;
+    }
 }
 
 GPUSpectrumImageTexture *GPUSpectrumImageTexture::Create(
@@ -1128,160 +1536,44 @@ GPUSpectrumImageTexture *GPUSpectrumImageTexture::Create(
             textureCacheMutex.unlock();
             isSingleChannel = true;
         } else {
+            // Cache miss: create the texture object with a placeholder texObj
+            // and defer the actual upload until FlushGPUTextureUploads().
+            // Coalesce: if an upload for this file is already pending, just
+            // attach this instance to it instead of queuing a redundant one.
+            TextureMapping2D mapping =
+                TextureMapping2D::Create(parameters, renderFromTexture, loc, alloc);
+
+            auto *tex = alloc.new_object<GPUSpectrumImageTexture>(filename, mapping,
+                                                                  /*texObj=*/0, scale,
+                                                                  invert,
+                                                                  /*isSingleChannel=*/false,
+                                                                  /*colorSpace=*/nullptr,
+                                                                  spectrumType);
+
+            std::string uploadKey = filename + std::string("\x01S");
+            auto pendIter = pendingUploadsByName.find(uploadKey);
+            if (pendIter != pendingUploadsByName.end()) {
+                pendingGPUTextureUploads[pendIter->second].spectrumTexes.push_back(tex);
+                textureCacheMutex.unlock();
+                return tex;
+            }
+
+            PendingGPUTextureUpload task;
+            task.filename = filename;
+            task.encoding = encoding;
+            task.wrapString = wrapString;
+            task.filter = filter;
+            task.maxAniso = maxAniso;
+            task.scale = scale;
+            task.invert = invert;
+            task.isSpectrum = true;
+            task.spectrumType = spectrumType;
+            task.loc = loc;
+            task.spectrumTexes.push_back(tex);
+            size_t idx = RegisterPendingGPUTextureUpload(std::move(task));
+            pendingUploadsByName[uploadKey] = idx;
             textureCacheMutex.unlock();
-
-            {
-                ImageAndMetadata immeta = Image::Read(filename);
-                Image &image = immeta.image;
-
-                readMode = image.Format() == PixelFormat::U256
-                               ? cudaReadModeNormalizedFloat
-                               : cudaReadModeElementType;
-                colorSpace = immeta.metadata.GetColorSpace();
-
-                ImageChannelDesc rgbDesc = image.GetChannelDesc({"R", "G", "B"});
-                if (rgbDesc) {
-                    image = image.SelectChannels(rgbDesc);
-
-                    MIPMap mipmap(image, colorSpace, WrapMode::Clamp /* TODO */,
-                                  Allocator(), MIPMapFilterOptions());
-                    nMIPMapLevels = mipmap.Levels();
-                    const Image &baseImage = mipmap.GetLevel(0);
-
-                    switch (image.Format()) {
-                    case PixelFormat::U256: {
-                        cudaChannelFormatDesc channelDesc = cudaCreateChannelDesc(
-                            8, 8, 8, 8, cudaChannelFormatKindUnsigned);
-
-                        cudaExtent extent = make_cudaExtent(baseImage.Resolution().x,
-                                                            baseImage.Resolution().y, 0);
-                        CUDA_CHECK(cudaMallocMipmappedArray(&mipArray, &channelDesc,
-                                                            extent, mipmap.Levels(),
-                                                            0 /* flags */));
-                        for (int level = 0; level < mipmap.Levels(); ++level) {
-                            const Image &levelImage = mipmap.GetLevel(level);
-                            cudaArray_t levelArray;
-                            CUDA_CHECK(
-                                cudaGetMipmappedArrayLevel(&levelArray, mipArray, level));
-
-                            std::vector<uint8_t> rgba(4 * levelImage.Resolution().x *
-                                                      levelImage.Resolution().y);
-                            size_t offset = 0;
-                            for (int y = 0; y < levelImage.Resolution().y; ++y)
-                                for (int x = 0; x < levelImage.Resolution().x; ++x) {
-                                    for (int c = 0; c < 3; ++c)
-                                        rgba[offset++] =
-                                            ((uint8_t *)levelImage.RawPointer({x, y}))[c];
-                                    rgba[offset++] = 255;
-                                }
-
-                            int pitch = levelImage.Resolution().x * 4 * sizeof(uint8_t);
-                            gpuImageTextureBytes += pitch * levelImage.Resolution().y;
-
-                            CUDA_CHECK(cudaMemcpy2DToArray(
-                                levelArray,
-                                /* offset */ 0, 0, rgba.data(), pitch, pitch,
-                                levelImage.Resolution().y, cudaMemcpyHostToDevice));
-                        }
-                        break;
-                    }
-                    case PixelFormat::Half: {
-                        cudaChannelFormatDesc channelDesc = cudaCreateChannelDesc(
-                            16, 16, 16, 16, cudaChannelFormatKindFloat);
-
-                        cudaExtent extent = make_cudaExtent(baseImage.Resolution().x,
-                                                            baseImage.Resolution().y, 0);
-                        CUDA_CHECK(cudaMallocMipmappedArray(&mipArray, &channelDesc,
-                                                            extent, mipmap.Levels(),
-                                                            0 /* flags */));
-
-                        for (int level = 0; level < mipmap.Levels(); ++level) {
-                            const Image &levelImage = mipmap.GetLevel(level);
-                            cudaArray_t levelArray;
-                            CUDA_CHECK(
-                                cudaGetMipmappedArrayLevel(&levelArray, mipArray, level));
-
-                            std::vector<Half> rgba(4 * levelImage.Resolution().x *
-                                                   levelImage.Resolution().y);
-
-                            size_t offset = 0;
-                            for (int y = 0; y < levelImage.Resolution().y; ++y)
-                                for (int x = 0; x < levelImage.Resolution().x; ++x) {
-                                    for (int c = 0; c < 3; ++c)
-                                        rgba[offset++] =
-                                            Half(levelImage.GetChannel({x, y}, c));
-                                    rgba[offset++] = Half(1.f);
-                                }
-
-                            int pitch = levelImage.Resolution().x * 4 * sizeof(Half);
-                            gpuImageTextureBytes += pitch * levelImage.Resolution().y;
-
-                            CUDA_CHECK(cudaMemcpy2DToArray(
-                                levelArray,
-                                /* offset */ 0, 0, rgba.data(), pitch, pitch,
-                                levelImage.Resolution().y, cudaMemcpyHostToDevice));
-                        }
-                        break;
-                    }
-                    case PixelFormat::Float: {
-                        cudaChannelFormatDesc channelDesc = cudaCreateChannelDesc(
-                            32, 32, 32, 32, cudaChannelFormatKindFloat);
-
-                        cudaExtent extent = make_cudaExtent(baseImage.Resolution().x,
-                                                            baseImage.Resolution().y, 0);
-                        CUDA_CHECK(cudaMallocMipmappedArray(&mipArray, &channelDesc,
-                                                            extent, mipmap.Levels(),
-                                                            0 /* flags */));
-
-                        for (int level = 0; level < mipmap.Levels(); ++level) {
-                            const Image &levelImage = mipmap.GetLevel(level);
-                            cudaArray_t levelArray;
-                            CUDA_CHECK(
-                                cudaGetMipmappedArrayLevel(&levelArray, mipArray, level));
-
-                            std::vector<float> rgba(4 * levelImage.Resolution().x *
-                                                    levelImage.Resolution().y);
-
-                            size_t offset = 0;
-                            for (int y = 0; y < levelImage.Resolution().y; ++y)
-                                for (int x = 0; x < levelImage.Resolution().x; ++x) {
-                                    for (int c = 0; c < 3; ++c)
-                                        rgba[offset++] = levelImage.GetChannel({x, y}, c);
-                                    rgba[offset++] = 1.f;
-                                }
-
-                            int pitch = levelImage.Resolution().x * 4 * sizeof(float);
-                            gpuImageTextureBytes += pitch * levelImage.Resolution().y;
-
-                            CUDA_CHECK(cudaMemcpy2DToArray(
-                                levelArray,
-                                /* offset */ 0, 0, rgba.data(), pitch, pitch,
-                                levelImage.Resolution().y, cudaMemcpyHostToDevice));
-                        }
-                        break;
-                    }
-                    default:
-                        LOG_FATAL("Unexpected PixelFormat");
-                    }
-
-                    textureCacheMutex.lock();
-                    rgbTextureCache[filename] = RGBTextureCacheItem{
-                        mipArray, readMode, nMIPMapLevels, colorSpace};
-                    textureCacheMutex.unlock();
-                } else if (image.NChannels() == 1) {
-                    mipArray = createSingleChannelTextureArray(image, colorSpace,
-                                                               &nMIPMapLevels);
-
-                    textureCacheMutex.lock();
-                    lumTextureCache[filename] = LuminanceTextureCacheItem{
-                        mipArray, readMode, nMIPMapLevels, true};
-                    textureCacheMutex.unlock();
-                    isSingleChannel = true;
-                } else {
-                    Warning(loc, "%s: unable to decipher image format", filename);
-                    return nullptr;
-                }
-            }  // profile scope
+            return tex;
         }
     }
 
@@ -1355,52 +1647,39 @@ GPUFloatImageTexture *GPUFloatImageTexture::Create(
         nMIPMapLevels = iter->second.nMIPMapLevels;
         textureCacheMutex.unlock();
     } else {
-        textureCacheMutex.unlock();
+        // Cache miss: create the texture object with a placeholder texObj
+        // and defer the actual upload until FlushGPUTextureUploads().
+        // Coalesce: attach this instance to an already-pending upload for the
+        // same file rather than queuing a redundant GPU upload.
+        TextureMapping2D mapping =
+            TextureMapping2D::Create(parameters, renderFromTexture, loc, alloc);
 
-        ImageAndMetadata immeta = Image::Read(filename);
-        Image &image = immeta.image;
-        const RGBColorSpace *colorSpace = immeta.metadata.GetColorSpace();
+        auto *tex = alloc.new_object<GPUFloatImageTexture>(filename, mapping,
+                                                           /*texObj=*/0, scale, invert);
 
-        bool convertedImage = false;
-        if (image.NChannels() != 1) {
-            ImageChannelDesc rgbaDesc = image.GetChannelDesc({"R", "G", "B", "A"});
-            ImageChannelDesc rgbDesc = image.GetChannelDesc({"R", "G", "B"});
-            auto allOnes = [&]() {
-                for (int y = 0; y < image.Resolution().y; ++y)
-                    for (int x = 0; x < image.Resolution().x; ++x)
-                        if (image.GetChannels({x, y}, rgbaDesc)[3] != 1)
-                            return false;
-                return true;
-            };
-            if (rgbaDesc && !allOnes()) {
-                ImageChannelDesc alphaDesc = image.GetChannelDesc({"A"});
-                image = image.SelectChannels(alphaDesc);
-                convertedImage = true;
-            } else if (rgbDesc) {
-                // Convert to one channel
-                Image avgImage(image.Format(), image.Resolution(), {"Y"},
-                               image.Encoding());
-
-                for (int y = 0; y < image.Resolution().y; ++y)
-                    for (int x = 0; x < image.Resolution().x; ++x)
-                        avgImage.SetChannel({x, y}, 0,
-                                            image.GetChannels({x, y}, rgbDesc).Average());
-
-                image = std::move(avgImage);
-                convertedImage = true;
-            } else
-                ErrorExit(loc, "%s: %d channel image, without RGB channels.", filename,
-                          image.NChannels());
+        std::string uploadKey = filename + std::string("\x01F");
+        auto pendIter = pendingUploadsByName.find(uploadKey);
+        if (pendIter != pendingUploadsByName.end()) {
+            pendingGPUTextureUploads[pendIter->second].floatTexes.push_back(tex);
+            textureCacheMutex.unlock();
+            return tex;
         }
 
-        mipArray = createSingleChannelTextureArray(image, colorSpace, &nMIPMapLevels);
-        readMode = (image.Format() == PixelFormat::U256) ? cudaReadModeNormalizedFloat
-                                                         : cudaReadModeElementType;
-
-        textureCacheMutex.lock();
-        lumTextureCache[filename] =
-            LuminanceTextureCacheItem{mipArray, readMode, nMIPMapLevels, !convertedImage};
+        PendingGPUTextureUpload task;
+        task.filename = filename;
+        task.encoding = encoding;
+        task.wrapString = wrapString;
+        task.filter = filter;
+        task.maxAniso = maxAniso;
+        task.scale = scale;
+        task.invert = invert;
+        task.isSpectrum = false;
+        task.loc = loc;
+        task.floatTexes.push_back(tex);
+        size_t idx = RegisterPendingGPUTextureUpload(std::move(task));
+        pendingUploadsByName[uploadKey] = idx;
         textureCacheMutex.unlock();
+        return tex;
     }
 
     cudaResourceDesc resDesc = {};

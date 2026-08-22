@@ -902,9 +902,19 @@ endif ()
 # Taskflow (vendored) for parallel CPU work / task graphs during scene upload.
 target_include_directories (pbrt_lib SYSTEM PUBLIC ${PBRT_SOURCE_CODE}/src/ext/taskflow)
 
+# Host-only helper library: keeps the Taskflow headers out of nvcc's sight
+# (cudafe++ crashes when parsing them), while pbrt_lib's CUDA TUs just pass
+# plain std::function closures across the boundary.
+add_library (pbrt_taskflow STATIC src/pbrt/util/parallel_tasks.cpp)
+target_include_directories (pbrt_taskflow SYSTEM PRIVATE ${PBRT_SOURCE_CODE}/src/ext ${PBRT_SOURCE_CODE}/src ${CMAKE_BINARY_DIR})
+target_compile_features (pbrt_taskflow PRIVATE cxx_std_17)
+if (PBRT_CUDA_ENABLED)
+    set_property (TARGET pbrt_taskflow PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS OFF)
+endif ()
+
 target_compile_options (pbrt_lib PUBLIC ${PBRT_CXX_FLAGS})
 
-target_link_libraries (pbrt_lib PRIVATE OpenEXR::OpenEXR pbrt_warnings pbrt_opt $<$<BOOL:PBRT_CUDA_ENABLED>:cuda_build_configuration>)
+target_link_libraries (pbrt_lib PRIVATE OpenEXR::OpenEXR pbrt_warnings pbrt_opt pbrt_taskflow $<$<BOOL:PBRT_CUDA_ENABLED>:cuda_build_configuration>)
 
 add_sanitizers (pbrt_lib)
 

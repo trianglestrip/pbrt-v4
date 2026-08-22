@@ -9,6 +9,7 @@
 #include <pbrt/film.h>
 #include <pbrt/filters.h>
 #ifdef PBRT_BUILD_GPU_RENDERER
+#include <pbrt/gpu/gpu_texture_upload.h>
 #include <pbrt/gpu/optix/aggregate.h>
 #include <pbrt/gpu/memory.h>
 #endif  // PBRT_BUILD_GPU_RENDERER
@@ -134,6 +135,11 @@ WavefrontPathIntegrator::WavefrontPathIntegrator(
     std::map<std::string, pbrt::Material> namedMaterials;
     std::vector<pbrt::Material> materials;
     scene.CreateMaterials(textures, &namedMaterials, &materials);
+
+#ifdef PBRT_BUILD_GPU_RENDERER
+    // Execute all deferred GPU texture uploads in parallel (Taskflow).
+    FlushGPUTextureUploads();
+#endif
 
     haveBasicEvalMaterial.fill(false);
     haveUniversalEvalMaterial.fill(false);

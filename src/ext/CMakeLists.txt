@@ -29,26 +29,31 @@ set_property (TARGET deflate PROPERTY FOLDER "ext")
 
 ###########################################################################
 # zlib
+#
+# pbrt vendors zlib; always build it in-tree rather than relying on
+# find_package(ZLIB).  A cached ZLIB_FOUND from a previous configure made
+# find_package short-circuit and skip add_subdirectory(zlib) on reconfigure,
+# which dropped the zlibstatic target and broke linking (LNK1181).
+set (ZLIB_BUILD_STATIC_LIBS ON CACHE BOOL " " FORCE)
+set (ZLIB_BUILD_SHARED_LIBS OFF CACHE BOOL " " FORCE)
+add_subdirectory (zlib)
 
-find_package (ZLIB)
-if (NOT ZLIB_FOUND)
-    # Build zlib
-    set (ZLIB_BUILD_STATIC_LIBS ON CACHE BOOL " " FORCE)
-    set (ZLIB_BUILD_SHARED_LIBS OFF CACHE BOOL " " FORCE)
-    add_subdirectory (zlib)
+set_property (TARGET zlibstatic PROPERTY FOLDER "ext")
 
-    # Set as CACHE variables so they are visible to OpenEXR find_package
-    set (ZLIB_LIBRARIES zlibstatic CACHE STRING "zlib library" FORCE)
-    set (ZLIB_INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/zlib ${CMAKE_CURRENT_BINARY_DIR}/zlib CACHE STRING "zlib include dirs" FORCE)
-    set (ZLIB_LIBRARY zlibstatic CACHE STRING "zlib library" FORCE)
-    set (ZLIB_INCLUDE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/zlib ${CMAKE_CURRENT_BINARY_DIR}/zlib CACHE STRING "zlib include dir" FORCE)
-    set (ZLIB_FOUND TRUE CACHE BOOL "zlib found" FORCE)
+# The zlib build sets OUTPUT_NAME to "zs" (z${suffix}.lib). Linkers
+# everywhere refer to this lib by the target name "zlibstatic", so rename
+# the output back to "zlibstatic.lib"; otherwise Link chokes on an
+# unresolvable "zlibstatic" input (LNK1181).
+set_target_properties (zlibstatic PROPERTIES OUTPUT_NAME zlibstatic)
 
-    set_property (TARGET zlibstatic PROPERTY FOLDER "ext")
+add_library (ZLIB::ZLIB ALIAS zlibstatic)
+include_directories(${ZLIB_INCLUDE_DIRS})  # yuck, but so openexr/ptex can find zlib.h...
 
-    add_library (ZLIB::ZLIB ALIAS zlibstatic)
-    include_directories(${ZLIB_INCLUDE_DIRS})  # yuck, but so openexr/ptex can find zlib.h...
-endif ()
+# Set as CACHE variables so they are visible to OpenEXR find_package
+set (ZLIB_INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/zlib ${CMAKE_CURRENT_BINARY_DIR}/zlib CACHE STRING "zlib include dirs" FORCE)
+set (ZLIB_LIBRARY zlibstatic CACHE STRING "zlib library" FORCE)
+set (ZLIB_INCLUDE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/zlib ${CMAKE_CURRENT_BINARY_DIR}/zlib CACHE STRING "zlib include dir" FORCE)
+set (ZLIB_FOUND TRUE CACHE BOOL "zlib found" FORCE)
 
 set (ZLIB_INCLUDE_DIRS ${ZLIB_INCLUDE_DIRS} PARENT_SCOPE)
 set (ZLIB_LIBRARIES ${ZLIB_LIBRARIES} PARENT_SCOPE)

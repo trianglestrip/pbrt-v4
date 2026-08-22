@@ -218,14 +218,36 @@ Current end-to-end phase breakdown (clean run):
 | wpi-pre-flush | 9.3 |
 | optix-init | 1.5 |
 | optix-prepare-ply | 0.9 |
-| optix-bvh-triangles-fn | 10.2 |
+| optix-bvh-triangles-fn | ~4 (P5 parallel; was 9.6 serial) |
 | optix-accelbuild | 0.1 |
 | texture-upload (bg thread) | 12.7 |
 | **gpu-build+upload+bvh** | **22.4** |
 | render-total | 24.3 |
 
-The real remaining separable costs are `optix-bvh-triangles-fn` (serial flatten,
-P5 candidate) and `wpi-CreateTextures` (7.5 s, B candidate).
+The real remaining separable cost is `wpi-CreateTextures` (~7.5–12.6 s, the
+per-reference texture *object* instantiation — B candidate); the OptiX/mesh side
+is no longer on the wall-critical path because `texture-upload` (~12–23 s,
+variable) gates it.
+
+## Parallelize triangle-mesh creation (P5)
+
+In `buildBVHForTriangles`, the first `ParallelFor` (per-mesh `Triangle::CreateMesh`
+/ `LoopSubdivide` / PLY construction, ~8.8 s **serial** under `DisableThreadPool`)
+was the dominant cost inside `optix-bvh-triangles-fn` (~9.6 s). Added a manual
+`std::thread` pool, `ParallelForManual` (`gpu/optix/aggregate.cpp`), capped at
+*half* the cores so the concurrent background texture upload keeps headroom
+(full subscription oversubscribes the machine and slows both phases). Each worker
+obtains its own allocator via `threadAllocators.Get()`, which is backed by the
+managed memory resource, so the meshes stay GPU-visible; no managed memory is
+touched during the OptiX build itself. Output is pixel-identical to the committed
+reference (EXR byte-diff shows only the 4 non-deterministic header bytes).
+
+Result: `optix-tri-meshCreate` drops to ~3–4 s when cores are available (vs 8.8 s
+serial). Net wall saving is only ~1 s, because `gpu-build` is now gated by
+`wpi-CreateTextures` (~7.5–12.6 s) + `texture-upload` (~12–23 s, variable); the
+OptiX/mesh side is no longer the critical path. The change is still worthwhile:
+it removes a genuinely serial 8.8 s stage and helps on unloaded / many-core
+machines and once the texture pipeline is faster.
 
 ## How to render
 

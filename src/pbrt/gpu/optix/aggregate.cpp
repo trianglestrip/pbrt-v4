@@ -24,6 +24,7 @@
 #include <atomic>
 #include <chrono>
 #include <mutex>
+#include <thread>
 #include <unordered_map>
 
 // Cumulative wall-clock spent in optixAccelBuild (incl. compaction) across all
@@ -190,6 +191,43 @@ OptixTraversableHandle OptiXAggregate::buildOptixBVH(
         std::memory_order_relaxed);
 
     return traversableHandle;
+}
+
+// Manual parallel-for over [0, n) using a fixed-size std::thread pool.
+// The global thread pool is disabled for the OptiX build on Windows (managed-
+// memory constraint, Issue #164) so ParallelFor runs serially there. This
+// helper lets CPU-bound, per-element work (e.g. triangle-mesh creation) still
+// run in parallel. Each worker thread obtains its own allocator via
+// threadAllocators.Get(), which is backed by the managed memory resource, so
+// the meshes produced remain GPU-accessible; no managed memory is touched
+// while the OptiX build itself runs.
+template <typename Func>
+static void ParallelForManual(int64_t n, Func &&func) {
+    // Use half the cores for mesh creation so the concurrent background texture
+    // upload (Taskflow, also many-threaded) keeps enough cores; full subscription
+    // here oversubscribes the machine and slows both phases.
+    unsigned int nThreads =
+        std::max(1u, std::thread::hardware_concurrency() / 2);
+    if (n <= 1 || nThreads <= 1) {
+        for (int64_t i = 0; i < n; ++i)
+            func(i);
+        return;
+    }
+    std::vector<std::thread> threads;
+    threads.reserve(nThreads);
+    int64_t chunk = (n + nThreads - 1) / nThreads;
+    for (unsigned t = 0; t < nThreads; ++t) {
+        int64_t start = t * chunk;
+        if (start >= n)
+            break;
+        int64_t end = std::min<int64_t>(n, start + chunk);
+        threads.emplace_back([&func, start, end]() {
+            for (int64_t i = start; i < end; ++i)
+                func(i);
+        });
+    }
+    for (auto &th : threads)
+        th.join();
 }
 
 static Material getMaterial(const ShapeSceneEntity &shape,
@@ -383,7 +421,7 @@ OptiXAggregate::BVH OptiXAggregate::buildBVHForTriangles(
 
     std::vector<TriangleMesh *> meshes(nMeshes, nullptr);
     std::vector<Bounds3f> meshBounds(nMeshes);
-    ParallelFor(0, nMeshes, [&](int64_t meshIndex) {
+    ParallelForManual(nMeshes, [&](int64_t meshIndex) {
         Allocator alloc = threadAllocators.Get();
         size_t shapeIndex = meshIndexToShapeIndex[meshIndex];
         const auto &shape = shapes[shapeIndex];
@@ -451,6 +489,9 @@ OptiXAggregate::BVH OptiXAggregate::buildBVHForTriangles(
         meshes[meshIndex] = mesh;
         meshBounds[meshIndex] = bounds;
     });
+    Printf("STAGE_TIMING [optix-tri-meshCreate] %.2f s\n",
+           std::chrono::duration<double>(std::chrono::high_resolution_clock::now() -
+                                          bvhStart).count());
 
     BVH bvh(nMeshes);
     std::vector<OptixBuildInput> optixBuildInputs(nMeshes);
@@ -560,6 +601,9 @@ OptiXAggregate::BVH OptiXAggregate::buildBVHForTriangles(
         std::lock_guard<std::mutex> lock(boundsMutex);
         bvh.bounds = Union(bvh.bounds, localBounds);
     });
+    Printf("STAGE_TIMING [optix-tri-buildInputs] %.2f s\n",
+           std::chrono::duration<double>(std::chrono::high_resolution_clock::now() -
+                                          bvhStart).count());
 
     // --- Bulk geometry upload (P1) -----------------------------------------
     // Concatenate all meshes' vertex/index data into single host staging
@@ -600,6 +644,9 @@ OptiXAggregate::BVH OptiXAggregate::buildBVHForTriangles(
     }
 
     auto upStart = std::chrono::high_resolution_clock::now();
+    Printf("STAGE_TIMING [optix-tri-flatten] %.2f s\n",
+           std::chrono::duration<double>(std::chrono::high_resolution_clock::now() -
+                                          bvhStart).count());
     float *vertDev = nullptr;
     int *idxDev = nullptr;
     if (totalVertBytes > 0) {

@@ -137,13 +137,20 @@ CPU-side per-mesh geometry upload + scene/texture construction. Plan executed:
 - **P3 — build flags / compaction (not beneficial, left as-is).** The OptiX
   `optixAccelBuild` is ~0.25 s; compaction would not move the needle.
 
-**Remaining bottleneck** (the next target, not yet optimized): the texture
-pipeline — `wpi-pre-flush` (image read/decode in `CreateTextures`, ~13.7 s) +
-`texture-upload` (~9.6 s) + `wpi-post-flush` (light preprocess / LightSampler /
-queue allocation, ~10 s). These are I/O + GPU-bandwidth + CPU scene-processing
-costs and overlap with the in-progress deferred-upload feature
-(`util/image.cpp` mmap reads, `util/parallel_tasks.*` Taskflow glue), so they
-were left for a follow-up rather than riskily refactored.
+**Remaining bottleneck** after P0–P4 + texture-overlap (deep-dive A below):
+- `optix-bvh-triangles-fn` (~10 s) — the **serial** flatten of 1591 meshes'
+  geometry into the concatenated buffer (`DisableThreadPool` forces the
+  `WavefrontPathIntegrator` ctor single-threaded). P1 only bulked the *upload*;
+  this CPU gather/copy step is untouched and is now the single biggest cost.
+- `wpi-CreateTextures` (~7.5 s) — per-reference texture *object* instantiation
+  (scene-graph construction, not I/O).
+- `texture-upload` (~12 s, runs on a background thread) — image decode + MIP +
+  GPU array copy (already Taskflow-parallel across 147 textures).
+
+`wpi-post-flush` (~13 s) is **not** a separate cost: it wraps the
+`OptiXAggregate` constructor, so it *is* `optix-ctor-total` (~12.6 s) plus the
+sub-0.3 s light Preprocess / LightSampler / queue allocation. There is nothing
+extra to squeeze there.
 
 All `STAGE_TIMING` prints remain in the code (cheap, useful for re-measuring);
 they can be gated behind a flag or removed for a clean PR.
@@ -161,7 +168,9 @@ instrumentation of the `WavefrontPathIntegrator` ctor shows, for
   per unique texture on a Taskflow executor (already parallel across the 147
   textures). Each task does `Image::Read` (decode) + MIPMap +
   `cudaMallocMipmappedArray` + per-level `cudaMemcpy2DToArray`.
-- `wpi-post-flush` ≈ 14 s — light Preprocess / LightSampler / queue allocation.
+- `wpi-post-flush` ≈ 13 s — but this wraps the `OptiXAggregate` ctor, so it is
+  essentially `optix-ctor-total`; light Preprocess / LightSampler / queue
+  allocation (instrumented separately) are all sub-0.3 s.
 
 **Change applied:** `FlushGPUTextureUploads()` is launched on a background
 `std::thread` right after `CreateTextures` builds the pending-upload list, and
@@ -181,6 +190,42 @@ more where there is spare CPU/GPU headroom.
 The dominant *unaddressed* cost is `wpi-CreateTextures` (~12 s) — texture
 object instantiation per reference — which is scene-graph construction, not the
 I/O/upload pipeline.
+
+## Deep-dive: wpi-post-flush (A)
+
+Instrumented the `WavefrontPathIntegrator` ctor sub-phases
+(`wpi-lightPreprocess`, `wpi-lightSampler`, `wpi-queueAlloc`) to chase the
+apparent ~14 s `wpi-post-flush`. Finding (clean run, `bistro_cafe_quick`):
+
+- `wpi-lightPreprocess` = 0.00 s
+- `wpi-lightSampler` = 0.30 s
+- `wpi-queueAlloc` = 0.06 s
+- `wpi-post-flush` = 13.02 s ≈ `optix-ctor-total` (12.59 s) + 0.43 s
+
+**Conclusion:** `wpi-post-flush`'s timer wraps the `OptiXAggregate` constructor
+(`aggregate = new OptiXAggregate(...)` at `wavefront/integrator.cpp:199`), so the
+~13 s is the OptiX build itself — already optimized by P1/P4. There is **no**
+hidden separable scene-setup cost in that span; light Preprocess, LightSampler,
+and queue allocation are all negligible. The earlier mental model of
+"post-flush = light/queue setup" was wrong.
+
+Current end-to-end phase breakdown (clean run):
+
+| phase | s |
+|---|---|
+| parse | 3.2 |
+| wpi-CreateTextures | 7.5 |
+| wpi-pre-flush | 9.3 |
+| optix-init | 1.5 |
+| optix-prepare-ply | 0.9 |
+| optix-bvh-triangles-fn | 10.2 |
+| optix-accelbuild | 0.1 |
+| texture-upload (bg thread) | 12.7 |
+| **gpu-build+upload+bvh** | **22.4** |
+| render-total | 24.3 |
+
+The real remaining separable costs are `optix-bvh-triangles-fn` (serial flatten,
+P5 candidate) and `wpi-CreateTextures` (7.5 s, B candidate).
 
 ## How to render
 

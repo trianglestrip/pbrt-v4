@@ -206,8 +206,12 @@ WavefrontPathIntegrator::WavefrontPathIntegrator(
                                      namedMaterials, materials);
 
     // Preprocess the light sources
+    auto tLightPre = std::chrono::high_resolution_clock::now();
     for (Light light : allLights)
         light.Preprocess(aggregate->Bounds());
+    Printf("STAGE_TIMING [wpi-lightPreprocess] %.2f s\n",
+           std::chrono::duration<double>(std::chrono::high_resolution_clock::now() -
+                                          tLightPre).count());
 
     bool haveLights = !allLights.empty();
     for (const auto &m : media)
@@ -220,7 +224,11 @@ WavefrontPathIntegrator::WavefrontPathIntegrator(
         scene.integrator.parameters.GetOneString("lightsampler", "bvh");
     if (allLights.size() == 1)
         lightSamplerName = "uniform";
+    auto tLS = std::chrono::high_resolution_clock::now();
     lightSampler = LightSampler::Create(lightSamplerName, allLights, alloc);
+    Printf("STAGE_TIMING [wpi-lightSampler] %.2f s\n",
+           std::chrono::duration<double>(std::chrono::high_resolution_clock::now() -
+                                          tLS).count());
     LOG_VERBOSE("Finished creating light sampler");
 
     if (scene.integrator.name != "path" && scene.integrator.name != "volpath")
@@ -272,6 +280,7 @@ WavefrontPathIntegrator::WavefrontPathIntegrator(
     LOG_VERBOSE("Will render in %d passes %d scanlines per pass\n", nPasses,
                 scanlinesPerPass);
 
+    auto tQA = std::chrono::high_resolution_clock::now();
     pixelSampleState = SOA<PixelSampleState>(maxQueueSize, alloc);
 
     rayQueues[0] = alloc.new_object<RayQueue>(maxQueueSize, alloc);
@@ -311,6 +320,10 @@ WavefrontPathIntegrator::WavefrontPathIntegrator(
     }
 
     stats = alloc.new_object<Stats>(maxDepth, alloc);
+
+    Printf("STAGE_TIMING [wpi-queueAlloc] %.2f s\n",
+           std::chrono::duration<double>(std::chrono::high_resolution_clock::now() -
+                                          tQA).count());
 
 #ifdef PBRT_BUILD_GPU_RENDERER
     if (Options->useGPU) {

@@ -473,6 +473,18 @@ render.  Next frontier if desired: producer/consumer texture uploads that
 drain pending uploads while CreateTextures is still running, which would
 overlap nearly all of the remaining 11 s.
 
+
+## Attempted and rejected: producer/consumer texture uploads
+
+With the ctor down to ~0.2 s, the ~11 s texture-upload pass became the
+exposed critical-path item. An incremental consumer (batches drained on a
+background thread started before CreateTextures, with an uploaded-flag to
+keep coalescing race-free) was implemented and measured: wall time got
+WORSE (~42 s vs ~33 s) -- decode competes with texture creation for the
+same cores and memory bandwidth, inflating both phases (CreateTextures
+7 -> 15 s). On this RAM/bandwidth-starved machine the upload is
+resource-bound, not schedule-bound; sequential phases are optimal.
+Reverted. This is the practical floor for this pipeline on this hardware.
 ## How to render
 
 ```bat

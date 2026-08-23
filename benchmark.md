@@ -474,29 +474,32 @@ drain pending uploads while CreateTextures is still running, which would
 overlap nearly all of the remaining 11 s.
 
 
-## Background texture-upload overlap during creation (working)
+## Attempted and REVERTED: background texture-upload overlap during creation
 
 With the ctor down to ~0.2 s, the ~11 s texture-upload pass became the
-exposed critical-path item. The upload is now drained incrementally by a
-background thread started *before* `CreateTextures`, so decode overlaps the
-(long, parallel) texture-creation phase. Key mechanics (in `textures.cpp` /
-`wavefront/integrator.cpp`):
+exposed critical-path item, so decode was overlapped with texture creation:
+a background thread (or inline `RunAsync` jobs) drained/uploads incrementally
+while `CreateTextures` ran, joined right after creation. Two implementations
+were tried:
 
-- Each batch is run through `RunParallelTasks`, which uses its OWN Taskflow
-  executor threads (not the pbrt global pool). Calling `ParallelFor` from the
-  drain thread (a plain `std::thread`) corrupts the pool's thread-index state
-  -- intermittent `STATUS_STACK_BUFFER_OVERRUN` crash. `RunParallelTasks` is
-  crash-free.
-- The drain is joined right after `CreateTextures` + `SetGPUTextureCreationDone`
-  so the texture caches are fully populated before material/aggregate setup
-  calls `getRGBTextureArray` (which assumes all uploads are done).
-- A per-entry `uploaded` flag keeps the coalescing attach-sites race-free: a
-  late creator either appends to the entry or adopts the finished result.
+- **`RunParallelTasks` (separate Taskflow executor)** for the decode batches:
+  measured `render-total` **~26-30 s** (vs ~33.6 s sequential) -- a ~4-7 s win
+  on the lucky runs.
+- **Single pbrt-pool scheduler** (`ParallelFor` from a drain thread, or each
+  upload as a `RunAsync` job during creation): should reach the ~11 s floor
+  (`max(create ~8-10s, decode ~11s)`) but both variants crash.
 
-Measured: `render-total` **~26-30 s** (4 runs, pixel-identical to
-`bistro_ref.exr`), vs the ~33.6 s sequential baseline -- a stable ~4-7 s win,
-no crashes. (First cut used `ParallelFor` from the drain thread and was both
-slower and crash-prone; corrected to `RunParallelTasks` + early join.)
+**Both crash intermittently with `STATUS_STACK_BUFFER_OVERRUN` (0xC0000109)** --
+typically after decode finishes, during the later material/aggregate setup that
+reads the texture caches. It is a genuine memory-corruption race in the overlap
+(decode writes shared cache / `texObj` state that the consolidation reads); the
+`RunParallelTasks` variant merely made it rarer (4/4 clean once, then 1/3
+crashed). A crash is unacceptable for a renderer, so the overlap was **reverted**
+to the sequential, single-shot `FlushGPUTextureUploads` (proven crash-free,
+`render-total` ~33.6 s). The ~4-7 s overlap win is NOT worth an intermittent
+corruption. Re-enabling it needs a correct fix for the underlying race (likely a
+lock guarding `getRGBTextureArray` / cache consolidation vs. in-flight uploads,
+or serializing the consolidation behind a confirmed "all uploads done" barrier).
 ## How to render
 
 ```bat

@@ -156,29 +156,12 @@ WavefrontPathIntegrator::WavefrontPathIntegrator(
 #endif
 
     // Task-graph branch 2 (main thread): textures -> lights -> materials.
-    // Start the texture-upload drain NOW (before creation) so decode runs on
-    // the same global thread pool and overlaps texture creation instead of
-    // running alone afterwards.
-    std::thread textureUploadThread;
-#ifdef PBRT_BUILD_GPU_RENDERER
-    if (Options->useGPU)
-        textureUploadThread = std::thread([]() { FlushGPUTextureUploads(); });
-#endif
     LOG_VERBOSE("Starting to create textures");
     auto tt0 = std::chrono::high_resolution_clock::now();
     NamedTextures textures = scene.CreateTextures();
-#ifdef PBRT_BUILD_GPU_RENDERER
-    if (Options->useGPU) {
-        SetGPUTextureCreationDone();
-        // Wait for the drain to finish now: decode overlapped the (long,
-        // parallel) creation phase, and the caches must be fully populated
-        // before material/aggregate setup calls getRGBTextureArray.
-        textureUploadThread.join();
-    }
-#endif
     Printf("STAGE_TIMING [wpi-CreateTextures] %.2f s\n",
            std::chrono::duration<double>(std::chrono::high_resolution_clock::now() -
-                                         tt0).count());
+                                          tt0).count());
     LOG_VERBOSE("Done creating textures");
 
     LOG_VERBOSE("Starting to create lights");
@@ -241,9 +224,12 @@ WavefrontPathIntegrator::WavefrontPathIntegrator(
     // the OptiX acceleration-structure build and the rest of scene setup that
     // follows. The upload target is device memory (not managed memory), so
     // this does not conflict with the DisableThreadPool managed-memory
-    // constraint. (The drain thread now starts before texture creation; see
-    // above. We join at the end of the constructor so all texObjs are
-    // populated before rendering starts.)
+    // constraint. We join at the end of the constructor so all texObjs are
+    // populated before rendering starts.
+    std::thread textureUploadThread;
+#ifdef PBRT_BUILD_GPU_RENDERER
+    textureUploadThread = std::thread([]() { FlushGPUTextureUploads(); });
+#endif
 
     haveBasicEvalMaterial.fill(false);
     haveUniversalEvalMaterial.fill(false);

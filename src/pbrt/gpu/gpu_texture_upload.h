@@ -14,10 +14,6 @@ namespace pbrt {
 // before rendering (and, on Windows, before OptiX BVH construction).
 void FlushGPUTextureUploads();
 
-// Signals that no further texture uploads will be registered (call after
-// scene texture creation completes).
-void SetGPUTextureCreationDone();
-
 }  // namespace pbrt
 
 #endif  // PBRT_GPU_TEXTURE_UPLOAD_H

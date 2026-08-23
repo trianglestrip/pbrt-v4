@@ -124,6 +124,7 @@ WavefrontPathIntegrator::WavefrontPathIntegrator(
     std::map<int, TriQuadMesh> preloadedPlyMeshes;
     std::vector<int> displacedPlyIndices;
     OptiXInitBundle optixInitBundle;
+    OptiXAggregate::TriGeometryData *triPreload = nullptr;
     std::thread plyPrepThread;
     if (Options->useGPU) {
         CUcontext cudaContext;
@@ -139,6 +140,16 @@ WavefrontPathIntegrator::WavefrontPathIntegrator(
                 OptiXAggregate::PreparePLYMeshesLoadOnly(scene.shapes);
             preloadedPlyMeshes = std::move(loaded.meshes);
             displacedPlyIndices = std::move(loaded.displacedIndices);
+
+            // Speculatively prepare and upload all triangle-mesh geometry as
+            // well: like everything above, it needs neither textures nor
+            // materials/lights.  If PLY displacement turns out to be present,
+            // the result is discarded after the join and the aggregate falls
+            // back to building geometry itself.
+            triPreload = new OptiXAggregate::TriGeometryData(
+                OptiXAggregate::PrepareTriangleGeometry(scene.shapes,
+                                                        preloadedPlyMeshes));
+            OptiXAggregate::UploadTriangleGeometry(*triPreload);
         });
         Printf("STAGE_TIMING [ply-preload] started in background\n");
     }
@@ -195,6 +206,14 @@ WavefrontPathIntegrator::WavefrontPathIntegrator(
                                               &preloadedPlyMeshes);
         Printf("STAGE_TIMING [ply-preload] ready (%zu meshes)\n",
                preloadedPlyMeshes.size());
+        if (!displacedPlyIndices.empty() && triPreload) {
+            // Geometry was speculatively built from undisplaced meshes;
+            // discard it so the aggregate builds correct geometry itself.
+            Printf("STAGE_TIMING [tri-preload] discarded (%d displaced meshes)\n",
+                   int(displacedPlyIndices.size()));
+            delete triPreload;
+            triPreload = nullptr;
+        }
     }
 #endif
 
@@ -239,7 +258,8 @@ WavefrontPathIntegrator::WavefrontPathIntegrator(
         aggregate = new OptiXAggregate(scene, mr, textures, shapeIndexToAreaLights, media,
                                        namedMaterials, materials,
                                        std::move(preloadedPlyMeshes),
-                                       Options->useGPU ? &optixInitBundle : nullptr);
+                                       Options->useGPU ? &optixInitBundle : nullptr,
+                                       triPreload);
 #else
         LOG_FATAL("Options->useGPU was set without PBRT_BUILD_GPU_RENDERER enabled");
 #endif

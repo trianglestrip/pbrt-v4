@@ -448,6 +448,31 @@ Next candidate if more is needed: move the whole geometry-prep+upload onto
 the background thread (it no longer needs textures/lights/materials at all);
 only SBT-record assembly must stay in the ctor after materials.
 
+
+## Background geometry pipeline: ctor drops to ~0.2 s
+
+The geometry stage moved fully onto the background thread.  After the PLY
+preload, the same thread now speculatively runs `PrepareTriangleGeometry`
+(host mesh build + staging concat, no CUDA) and `UploadTriangleGeometry`
+(bulk H2D on a private stream) -- neither needs textures/materials/lights.
+`buildBVHForTriangles` gained an early fast path: when preloaded geometry is
+handed in it only assembles SBT records (alpha/material/area-lights/media)
+and runs the acceleration build.
+
+If deferred PLY displacement turns out to be present, the speculative
+result is discarded after the join and the aggregate falls back to the
+original self-contained path (correctness preserved).
+
+Result (bistro_cafe_quick, 8 spp): optix-ctor-total 13 -> 0.10-0.21 s;
+geometry work (~0.6 s CPU + ~0.13 s DMA) fully hidden under CreateTextures.
+4/4 clean runs, pixel-identical vs reference (MAE == 0).
+
+The critical path is now: parse -> CreateTextures+Lights -> [ctor ~0.2 s] ->
+texture-upload join (~11 s, EXPOSED -- it used to hide behind the ctor) ->
+render.  Next frontier if desired: producer/consumer texture uploads that
+drain pending uploads while CreateTextures is still running, which would
+overlap nearly all of the remaining 11 s.
+
 ## How to render
 
 ```bat

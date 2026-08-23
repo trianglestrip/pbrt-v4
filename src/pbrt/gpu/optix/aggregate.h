@@ -50,6 +50,7 @@ struct OptiXInitBundle {
 
 class OptiXAggregate : public WavefrontAggregate {
   public:
+    struct TriGeometryData;
     // If initBundle is provided it is consumed (moved from); otherwise OptiX
     // is initialized here.  Passing a bundle lets the caller overlap OptiX
     // initialization with texture creation on a background thread.
@@ -60,13 +61,51 @@ class OptiXAggregate : public WavefrontAggregate {
                    const std::map<std::string, pbrt::Material> &namedMaterials,
                    const std::vector<pbrt::Material> &materials,
                    std::map<int, TriQuadMesh> preloadedPlyMeshes = {},
-                   OptiXInitBundle *initBundle = nullptr);
+                   OptiXInitBundle *initBundle = nullptr,
+                   TriGeometryData *preloadedTriGeo = nullptr);
 
     // Creates everything in OptiXInitBundle.  optixInit() + device context +
     // module + program groups + pipeline + raygen/miss SBT records.  Safe to
     // call from a background thread (the caller must have pushed the CUDA
     // context with cuCtxSetCurrent first).
     static OptiXInitBundle CreateOptiXBundle(CUcontext cudaContext);
+
+    // Geometry-only preparation for the main-scene triangle GAS.  Pure CPU +
+    // async H2D copies on a private stream -- no textures/materials/lights
+    // involved, so both stages can run on a background thread overlapped with
+    // texture creation.  Only valid when no PLY displacement was deferred
+    // (caller decides; otherwise discard the result).
+    struct TriGeometryData {
+        size_t nMeshes = 0;
+        std::vector<size_t> meshIndexToShapeIndex;
+        Bounds3f bounds;
+        // Host staging (freed after upload).
+        std::vector<float> allVerts;
+        std::vector<int> allIdx;
+        std::vector<Normal3f> allN;
+        std::vector<Vector3f> allS;
+        std::vector<Point2f> allUv;
+        std::vector<int> allFace;
+        std::vector<char> hMirrors;
+        // Per-mesh info for the SBT-record pass and build inputs.
+        struct MeshScalars {
+            int nTriangles;
+            int nVertices;
+        };
+        std::vector<MeshScalars> scalars;
+        std::vector<size_t> vertOffsetBytes, idxOffsetBytes;
+        std::vector<size_t> nOff, sOff, uvOff, faceOff;
+        size_t totalVertBytes = 0, totalIdxBytes = 0;
+        // Filled by UploadTriangleGeometry().
+        float *vertDev = nullptr;
+        int *idxDev = nullptr;
+        TriangleMesh *mirrorsDev = nullptr;
+    };
+    static TriGeometryData PrepareTriangleGeometry(
+        const std::vector<ShapeSceneEntity> &shapes,
+        const std::map<int, TriQuadMesh> &plyMeshes);
+    static void UploadTriangleGeometry(TriGeometryData &geo);
+    static void SyncTriangleGeometryUploads();
 
     Bounds3f Bounds() const { return bounds; }
 
@@ -146,7 +185,8 @@ class OptiXAggregate : public WavefrontAggregate {
         const std::map<std::string, Medium> &media,
         const std::map<int, pstd::vector<Light> *> &shapeIndexToAreaLights,
         ThreadLocal<Allocator> &threadAllocators,
-        ThreadLocal<cudaStream_t> &threadCUDAStreams);
+        ThreadLocal<cudaStream_t> &threadCUDAStreams,
+        TriGeometryData *preloadedGeometry = nullptr);
 
     static BilinearPatchMesh *diceCurveToBLP(const ShapeSceneEntity &shape, int nDiceU,
                                              int nDiceV, Allocator alloc);

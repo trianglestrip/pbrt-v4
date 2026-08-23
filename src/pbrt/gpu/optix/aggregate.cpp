@@ -34,6 +34,8 @@ static std::atomic<uint64_t> g_optixBuildTimeUs{0};
 // Cumulative wall-clock spent in per-mesh cudaMalloc + cudaMemcpy (the
 // "upload" portion of buildBVHForTriangles), in microseconds.
 static std::atomic<uint64_t> g_optixUploadUs{0};
+// Private stream for background-thread geometry uploads (UploadTriangleGeometry).
+static cudaStream_t g_geomPrepStream = nullptr;
 
 #include <optix.h>
 #include <optix_function_table_definition.h>
@@ -457,7 +459,109 @@ OptiXAggregate::BVH OptiXAggregate::buildBVHForTriangles(
     const std::vector<Material> &materials, const std::map<std::string, Medium> &media,
     const std::map<int, pstd::vector<Light> *> &shapeIndexToAreaLights,
     ThreadLocal<Allocator> &threadAllocators,
-    ThreadLocal<cudaStream_t> &threadCUDAStreams) {
+    ThreadLocal<cudaStream_t> &threadCUDAStreams,
+    TriGeometryData *preloadedGeometry) {
+    // Fast path: geometry was prepared and uploaded on a background thread
+    // (PrepareTriangleGeometry/UploadTriangleGeometry) while textures were
+    // being created.  Only the texture/material-dependent SBT records and the
+    // acceleration build remain.
+    if (preloadedGeometry) {
+        const TriGeometryData &geo = *preloadedGeometry;
+        size_t nMeshes = geo.nMeshes;
+        if (nMeshes == 0)
+            return {};
+        auto bvhStart = std::chrono::high_resolution_clock::now();
+
+        BVH bvh(nMeshes);
+        std::vector<OptixBuildInput> optixBuildInputs(nMeshes);
+        std::vector<CUdeviceptr> pDeviceDevicePtrs(nMeshes);
+        std::vector<uint32_t> triangleInputFlags(nMeshes);
+
+        std::array<uint8_t, OPTIX_SBT_RECORD_HEADER_SIZE> intersectHdr, randomHitHdr,
+            shadowHdr;
+        {
+            HitgroupRecord dummy;
+            OPTIX_CHECK(optixSbtRecordPackHeader(intersectPG, &dummy));
+            memcpy(intersectHdr.data(), &dummy, OPTIX_SBT_RECORD_HEADER_SIZE);
+            OPTIX_CHECK(optixSbtRecordPackHeader(randomHitPG, &dummy));
+            memcpy(randomHitHdr.data(), &dummy, OPTIX_SBT_RECORD_HEADER_SIZE);
+            OPTIX_CHECK(optixSbtRecordPackHeader(shadowPG, &dummy));
+            memcpy(shadowHdr.data(), &dummy, OPTIX_SBT_RECORD_HEADER_SIZE);
+        }
+
+        for (size_t meshIndex = 0; meshIndex < nMeshes; ++meshIndex) {
+            int shapeIndex = int(geo.meshIndexToShapeIndex[meshIndex]);
+            const auto &shape = shapes[shapeIndex];
+            Allocator alloc = threadAllocators.Get();
+
+            OptixBuildInput &input = optixBuildInputs[meshIndex];
+            input.type = OPTIX_BUILD_INPUT_TYPE_TRIANGLES;
+            input.triangleArray.vertexFormat = OPTIX_VERTEX_FORMAT_FLOAT3;
+            input.triangleArray.numVertices = geo.scalars[meshIndex].nVertices;
+            input.triangleArray.vertexStrideInBytes = 3 * sizeof(float);
+            input.triangleArray.indexFormat = OPTIX_INDICES_FORMAT_UNSIGNED_INT3;
+            input.triangleArray.indexStrideInBytes = 3 * sizeof(int);
+            input.triangleArray.numIndexTriplets = geo.scalars[meshIndex].nTriangles;
+
+            FloatTexture alphaTexture = getAlphaTexture(shape, floatTextures, alloc);
+            Material material = getMaterial(shape, namedMaterials, materials);
+            triangleInputFlags[meshIndex] = getOptixGeometryFlags(true, alphaTexture);
+            input.triangleArray.flags = &triangleInputFlags[meshIndex];
+
+            shape.parameters.ReportUnused();
+
+            input.triangleArray.numSbtRecords = 1;
+            input.triangleArray.sbtIndexOffsetBuffer = CUdeviceptr(nullptr);
+            input.triangleArray.sbtIndexOffsetSizeInBytes = 0;
+            input.triangleArray.sbtIndexOffsetStrideInBytes = 0;
+            pDeviceDevicePtrs[meshIndex] =
+                CUdeviceptr(geo.vertDev) + geo.vertOffsetBytes[meshIndex];
+            input.triangleArray.vertexBuffers = &pDeviceDevicePtrs[meshIndex];
+            input.triangleArray.indexBuffer =
+                CUdeviceptr(geo.idxDev) + geo.idxOffsetBytes[meshIndex];
+
+            HitgroupRecord hgRecord;
+            memcpy(&hgRecord, intersectHdr.data(), OPTIX_SBT_RECORD_HEADER_SIZE);
+            hgRecord.triRec.mesh =
+                (const TriangleMesh *)((char *)geo.mirrorsDev +
+                                       meshIndex * sizeof(TriangleMesh));
+            hgRecord.triRec.material = material;
+            hgRecord.triRec.alphaTexture = alphaTexture;
+            hgRecord.triRec.areaLights = {};
+            if (shape.lightIndex != -1) {
+                if (!material)
+                    Warning(&shape.loc, "Ignoring area light specification for shape "
+                                        "with \"interface\" material.");
+                else {
+                    auto iter = shapeIndexToAreaLights.find(shapeIndex);
+                    CHECK(iter != shapeIndexToAreaLights.end());
+                    CHECK_EQ(iter->second->size(), geo.scalars[meshIndex].nTriangles);
+                    hgRecord.triRec.areaLights = pstd::MakeSpan(*iter->second);
+                }
+            }
+            hgRecord.triRec.mediumInterface = getMediumInterface(shape, media, alloc);
+
+            bvh.intersectHGRecords[meshIndex] = hgRecord;
+
+            memcpy(&hgRecord, randomHitHdr.data(), OPTIX_SBT_RECORD_HEADER_SIZE);
+            bvh.randomHitHGRecords[meshIndex] = hgRecord;
+
+            memcpy(&hgRecord, shadowHdr.data(), OPTIX_SBT_RECORD_HEADER_SIZE);
+            bvh.shadowHGRecords[meshIndex] = hgRecord;
+        }
+
+        bvh.bounds = geo.bounds;
+        SyncTriangleGeometryUploads();
+        bvh.traversableHandle =
+            buildOptixBVH(optixContext, optixBuildInputs, threadCUDAStreams);
+
+        Printf("STAGE_TIMING [optix-bvh-triangles-fn] %.2f s (nMeshes=%llu, preloaded)\n",
+               std::chrono::duration<double>(std::chrono::high_resolution_clock::now() -
+                                             bvhStart).count(),
+               (unsigned long long)nMeshes);
+        return bvh;
+    }
+
     // Count how many of the shapes are triangle meshes
     std::vector<size_t> meshIndexToShapeIndex;
     for (size_t i = 0; i < shapes.size(); ++i) {
@@ -870,6 +974,276 @@ OptiXAggregate::BVH OptiXAggregate::buildBVHForTriangles(
     Printf("STAGE_TIMING [optix-bvh-triangles-upload] %.2f s\n",
            g_optixUploadUs.load() / 1e6);
     return bvh;
+}
+
+OptiXAggregate::TriGeometryData OptiXAggregate::PrepareTriangleGeometry(
+    const std::vector<ShapeSceneEntity> &shapes,
+    const std::map<int, TriQuadMesh> &plyMeshes) {
+    TriGeometryData geo;
+    auto prepStart = std::chrono::high_resolution_clock::now();
+
+    for (size_t i = 0; i < shapes.size(); ++i) {
+        const auto &shape = shapes[i];
+        if (shape.name == "trianglemesh" || shape.name == "plymesh" ||
+            shape.name == "loopsubdiv")
+            geo.meshIndexToShapeIndex.push_back(i);
+    }
+    size_t nMeshes = geo.meshIndexToShapeIndex.size();
+    if (nMeshes == 0)
+        return geo;
+
+    ResetManagedAllocStats();
+    std::atomic<uint64_t> meshCtorNs{0}, boundsNs{0};
+
+    // Host memory only (see buildBVHForTriangles fast path): no managed
+    // allocations, so the parallel build never stalls on cudaMallocManaged.
+    ThreadLocal<Allocator> threadHostAllocators([]() {
+        pstd::pmr::monotonic_buffer_resource *resource =
+            new pstd::pmr::monotonic_buffer_resource(16 * 1024 * 1024,
+                                                     pstd::pmr::new_delete_resource());
+        return Allocator(resource);
+    });
+
+    std::vector<TriangleMesh *> meshes(nMeshes, nullptr);
+    std::vector<Bounds3f> meshBounds(nMeshes);
+    ParallelForManual(nMeshes, [&](int64_t meshIndex) {
+        Allocator alloc = threadHostAllocators.Get();
+        size_t shapeIndex = geo.meshIndexToShapeIndex[meshIndex];
+        const auto &shape = shapes[shapeIndex];
+
+        auto mc0 = std::chrono::steady_clock::now();
+        TriangleMesh *mesh = nullptr;
+        if (shape.name == "trianglemesh") {
+            mesh = Triangle::CreateMesh(shape.renderFromObject, shape.reverseOrientation,
+                                        shape.parameters, &shape.loc, alloc);
+            CHECK(mesh != nullptr);
+        } else if (shape.name == "loopsubdiv") {
+            int nLevels = shape.parameters.GetOneInt("levels", 3);
+            std::vector<int> vertexIndices = shape.parameters.GetIntArray("indices");
+            if (vertexIndices.empty())
+                ErrorExit(&shape.loc, "Vertex indices \"indices\" not "
+                                      "provided for LoopSubdiv shape.");
+            std::vector<Point3f> P = shape.parameters.GetPoint3fArray("P");
+            if (P.empty())
+                ErrorExit(&shape.loc, "Vertex positions \"P\" not provided "
+                                      "for LoopSubdiv shape.");
+            std::string scheme = shape.parameters.GetOneString("scheme", "loop");
+            mesh = LoopSubdivide(shape.renderFromObject, shape.reverseOrientation,
+                                 nLevels, vertexIndices, P, alloc);
+            CHECK(mesh != nullptr);
+        } else if (shape.name == "plymesh") {
+            auto plyIter = plyMeshes.find(shapeIndex);
+            CHECK(plyIter != plyMeshes.end());
+            const TriQuadMesh &plyMesh = plyIter->second;
+            CHECK(plyMesh.quadIndices.empty() || shape.lightIndex == -1);
+
+            mesh = alloc.new_object<TriangleMesh>(
+                *shape.renderFromObject, shape.reverseOrientation, plyMesh.triIndices,
+                plyMesh.p, std::vector<Vector3f>(), plyMesh.n, plyMesh.uv,
+                plyMesh.faceIndices, alloc);
+        } else
+            LOG_FATAL("Logic error in PrepareTriangleGeometry()");
+
+        auto mc1 = std::chrono::steady_clock::now();
+        meshCtorNs.fetch_add(
+            uint64_t(std::chrono::duration<double, std::nano>(mc1 - mc0).count()));
+
+        Bounds3f bounds;
+        for (size_t i = 0; i < mesh->nVertices; ++i)
+            bounds = Union(bounds, mesh->p[i]);
+        boundsNs.fetch_add(uint64_t(
+            std::chrono::duration<double, std::nano>(
+                std::chrono::steady_clock::now() - mc1)
+                .count()));
+
+        meshes[meshIndex] = mesh;
+        meshBounds[meshIndex] = bounds;
+        geo.bounds = Union(geo.bounds, bounds);
+    });
+    Printf("STAGE_TIMING [optix-tri-pre-meshCreate] %.2f s\n",
+           std::chrono::duration<double>(std::chrono::high_resolution_clock::now() -
+                                         prepStart).count());
+    Printf("STAGE_TIMING [optix-tri-pre-detail] ctor %.2f s / managed-allocs %llu in %.2f s\n",
+           meshCtorNs.load() / 1e9, (unsigned long long)ManagedAllocCalls(),
+           ManagedAllocSeconds());
+
+    geo.nMeshes = nMeshes;
+    geo.scalars.resize(nMeshes);
+    for (size_t i = 0; i < nMeshes; ++i) {
+        geo.scalars[i] = {meshes[i]->nTriangles, meshes[i]->nVertices};
+    }
+
+    // --- staging concat -----------------------------------------------------
+    auto align16 = [](size_t x) { return (x + size_t(15)) & ~size_t(15); };
+    geo.vertOffsetBytes.resize(nMeshes);
+    geo.idxOffsetBytes.resize(nMeshes);
+    for (size_t i = 0; i < nMeshes; ++i) {
+        size_t vBytes = size_t(meshes[i]->nVertices) * 3 * sizeof(float);
+        geo.vertOffsetBytes[i] = align16(geo.totalVertBytes);
+        geo.totalVertBytes = geo.vertOffsetBytes[i] + vBytes;
+        size_t iBytes = size_t(meshes[i]->nTriangles) * 3 * sizeof(int);
+        geo.idxOffsetBytes[i] = align16(geo.totalIdxBytes);
+        geo.totalIdxBytes = geo.idxOffsetBytes[i] + iBytes;
+    }
+
+    geo.allVerts.resize(geo.totalVertBytes / sizeof(float), 0.f);
+    geo.allIdx.resize(geo.totalIdxBytes / sizeof(int), 0);
+    for (size_t i = 0; i < nMeshes; ++i) {
+        const TriangleMesh *mesh = meshes[i];
+        if (mesh->nVertices > 0) {
+#ifdef PBRT_FLOAT_AS_DOUBLE
+            float *dst =
+                &geo.allVerts[geo.vertOffsetBytes[i] / sizeof(float)];
+            for (int v = 0; v < mesh->nVertices; ++v) {
+                dst[3 * v] = float(mesh->p[v].x);
+                dst[3 * v + 1] = float(mesh->p[v].y);
+                dst[3 * v + 2] = float(mesh->p[v].z);
+            }
+#else
+            memcpy(&geo.allVerts[geo.vertOffsetBytes[i] / sizeof(float)], mesh->p,
+                   mesh->nVertices * 3 * sizeof(float));
+#endif
+        }
+        if (mesh->nTriangles > 0)
+            memcpy(&geo.allIdx[geo.idxOffsetBytes[i] / sizeof(int)],
+                   mesh->vertexIndices, mesh->nTriangles * 3 * sizeof(int));
+    }
+
+    // Normals/tangents/uv/faceIndices are appended per mesh in the same order
+    // as scalars; their per-mesh offsets are recovered during mirror patching
+    // by replaying the same loop.
+    std::vector<const Normal3f *> nPtrs(nMeshes, nullptr);
+    std::vector<const Vector3f *> sPtrs(nMeshes, nullptr);
+    std::vector<const Point2f *> uvPtrs(nMeshes, nullptr);
+    std::vector<const int *> facePtrs(nMeshes, nullptr);
+    for (size_t i = 0; i < nMeshes; ++i) {
+        nPtrs[i] = meshes[i]->n;
+        sPtrs[i] = meshes[i]->s;
+        uvPtrs[i] = meshes[i]->uv;
+        facePtrs[i] = meshes[i]->faceIndices;
+    }
+    for (size_t i = 0; i < nMeshes; ++i) {
+        if (nPtrs[i])
+            geo.allN.insert(geo.allN.end(), nPtrs[i], nPtrs[i] + meshes[i]->nVertices);
+        if (sPtrs[i])
+            geo.allS.insert(geo.allS.end(), sPtrs[i], sPtrs[i] + meshes[i]->nVertices);
+        if (uvPtrs[i])
+            geo.allUv.insert(geo.allUv.end(), uvPtrs[i], uvPtrs[i] + meshes[i]->nVertices);
+        if (facePtrs[i])
+            geo.allFace.insert(geo.allFace.end(), facePtrs[i],
+                               facePtrs[i] + meshes[i]->nTriangles);
+    }
+    geo.nOff.resize(nMeshes);
+    geo.sOff.resize(nMeshes);
+    geo.uvOff.resize(nMeshes);
+    geo.faceOff.resize(nMeshes);
+    {
+        size_t o = 0;
+        for (size_t i = 0; i < nMeshes; ++i) {
+            geo.nOff[i] = o;
+            if (nPtrs[i]) o += meshes[i]->nVertices;
+        }
+        o = 0;
+        for (size_t i = 0; i < nMeshes; ++i) {
+            geo.sOff[i] = o;
+            if (sPtrs[i]) o += meshes[i]->nVertices;
+        }
+        o = 0;
+        for (size_t i = 0; i < nMeshes; ++i) {
+            geo.uvOff[i] = o;
+            if (uvPtrs[i]) o += meshes[i]->nVertices;
+        }
+        o = 0;
+        for (size_t i = 0; i < nMeshes; ++i) {
+            geo.faceOff[i] = o;
+            if (facePtrs[i]) o += meshes[i]->nTriangles;
+        }
+    }
+
+    // Host mirrors: byte copies of each mesh object; array pointers are
+    // patched to device buffers during upload.
+    geo.hMirrors.resize(sizeof(TriangleMesh) * nMeshes);
+    TriangleMesh *hM = reinterpret_cast<TriangleMesh *>(geo.hMirrors.data());
+    for (size_t i = 0; i < nMeshes; ++i)
+        memcpy(hM + i, meshes[i], sizeof(TriangleMesh));
+
+    Printf("STAGE_TIMING [optix-tri-pre-flatten] %.2f s\n",
+           std::chrono::duration<double>(std::chrono::high_resolution_clock::now() -
+                                         prepStart).count());
+    return geo;
+}
+
+void OptiXAggregate::UploadTriangleGeometry(TriGeometryData &geo) {
+    if (geo.nMeshes == 0 || geo.hMirrors.empty())
+        return;
+    auto upStart = std::chrono::high_resolution_clock::now();
+
+    if (!g_geomPrepStream)
+        CUDA_CHECK(cudaStreamCreate(&g_geomPrepStream));
+    auto up = [&](const void *host, size_t bytes) -> void * {
+        void *dev = nullptr;
+        if (bytes > 0) {
+            CUDA_CHECK(cudaMalloc(&dev, bytes));
+            CUDA_CHECK(cudaMemcpyAsync(dev, host, bytes, cudaMemcpyHostToDevice,
+                                       g_geomPrepStream));
+        }
+        return dev;
+    };
+
+    geo.vertDev = (float *)up(geo.allVerts.data(), geo.totalVertBytes);
+    geo.idxDev = (int *)up(geo.allIdx.data(), geo.totalIdxBytes);
+    Normal3f *nDev = (Normal3f *)up(geo.allN.data(), geo.allN.size() * sizeof(Normal3f));
+    Vector3f *sDev = (Vector3f *)up(geo.allS.data(), geo.allS.size() * sizeof(Vector3f));
+    Point2f *uvDev = (Point2f *)up(geo.allUv.data(), geo.allUv.size() * sizeof(Point2f));
+    int *faceDev = (int *)up(geo.allFace.data(), geo.allFace.size() * sizeof(int));
+
+    // Patch the host mirrors' array pointers to the device buffers and queue
+    // the mirror upload.  (Copies may still be in flight -- pointers are
+    // already valid.)
+    TriangleMesh *hM = reinterpret_cast<TriangleMesh *>(geo.hMirrors.data());
+    for (size_t i = 0; i < geo.nMeshes; ++i) {
+        TriangleMesh *mm = hM + i;
+        mm->p = (const Point3f *)((char *)geo.vertDev + geo.vertOffsetBytes[i]);
+        mm->vertexIndices = (const int *)((char *)geo.idxDev + geo.idxOffsetBytes[i]);
+        mm->n = geo.allN.empty() ? nullptr
+                                 : (const Normal3f *)((char *)nDev +
+                                                      geo.nOff[i] * sizeof(Normal3f));
+        mm->s = geo.allS.empty()
+                    ? nullptr
+                    : (const Vector3f *)((char *)sDev + geo.sOff[i] * sizeof(Vector3f));
+        mm->uv = geo.allUv.empty()
+                     ? nullptr
+                     : (const Point2f *)((char *)uvDev + geo.uvOff[i] * sizeof(Point2f));
+        mm->faceIndices =
+            geo.allFace.empty()
+                ? nullptr
+                : (const int *)((char *)faceDev + geo.faceOff[i] * sizeof(int));
+    }
+    geo.mirrorsDev = (TriangleMesh *)up(hM, geo.hMirrors.size());
+
+    // The background thread has nothing else to do, so block until the DMA
+    // completes; this both makes freeing the (pageable) staging buffers safe
+    // and releases ~700 MB of host RAM back while texture creation continues
+    // on the main thread.
+    CUDA_CHECK(cudaStreamSynchronize(g_geomPrepStream));
+    geo.allVerts = {};
+    geo.allIdx = {};
+    geo.allN = {};
+    geo.allS = {};
+    geo.allUv = {};
+    geo.allFace = {};
+    geo.hMirrors = {};
+
+    Printf("STAGE_TIMING [optix-tri-pre-upload] %.2f s\n",
+           std::chrono::duration<double>(std::chrono::high_resolution_clock::now() -
+                                         upStart).count());
+}
+
+void OptiXAggregate::SyncTriangleGeometryUploads() {
+    // Safety net for the preloaded path: UploadTriangleGeometry already
+    // synchronized before returning, so this is a no-op in practice.
+    if (g_geomPrepStream)
+        CUDA_CHECK(cudaStreamSynchronize(g_geomPrepStream));
 }
 
 STAT_COUNTER("Geometry/Curves", nCurves);
@@ -1630,7 +2004,7 @@ OptiXAggregate::OptiXAggregate(
     const std::map<std::string, pbrt::Material> &namedMaterials,
     const std::vector<pbrt::Material> &materials,
     std::map<int, TriQuadMesh> preloadedPlyMeshes,
-    OptiXInitBundle *initBundle)
+    OptiXInitBundle *initBundle, OptiXAggregate::TriGeometryData *preloadedTriGeo)
     : memoryResource(memoryResource), cudaStream(nullptr) {
     auto initStart = std::chrono::high_resolution_clock::now();
 
@@ -1786,7 +2160,8 @@ OptiXAggregate::OptiXAggregate(
         BVH triangleBVH = buildBVHForTriangles(
             scene.shapes, plyMeshes, optixContext, hitPGTriangle, anyhitPGShadowTriangle,
             hitPGRandomHitTriangle, textures.floatTextures, namedMaterials, materials,
-            media, shapeIndexToAreaLights, threadAllocators, threadCUDAStreams);
+            media, shapeIndexToAreaLights, threadAllocators, threadCUDAStreams,
+            preloadedTriGeo);
         int sbtOffset = addHGRecords(triangleBVH);
         return new GAS{std::move(triangleBVH), sbtOffset};
     });

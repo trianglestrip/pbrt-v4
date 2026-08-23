@@ -123,10 +123,18 @@ WavefrontPathIntegrator::WavefrontPathIntegrator(
 #ifdef PBRT_BUILD_GPU_RENDERER
     std::map<int, TriQuadMesh> preloadedPlyMeshes;
     std::vector<int> displacedPlyIndices;
+    OptiXInitBundle optixInitBundle;
     std::thread plyPrepThread;
     if (Options->useGPU) {
+        CUcontext cudaContext;
+        CU_CHECK(cuCtxGetCurrent(&cudaContext));
         auto plyPrepStart = std::chrono::high_resolution_clock::now();
         plyPrepThread = std::thread([&]() {
+            // OptiX initialization has no dependency on textures/lights/
+            // materials, so build the context/module/program-groups here and
+            // overlap it with texture creation on the main thread.
+            CU_CHECK(cuCtxSetCurrent(cudaContext));
+            optixInitBundle = OptiXAggregate::CreateOptiXBundle(cudaContext);
             OptiXAggregate::LoadedPlyMeshes loaded =
                 OptiXAggregate::PreparePLYMeshesLoadOnly(scene.shapes);
             preloadedPlyMeshes = std::move(loaded.meshes);
@@ -230,7 +238,8 @@ WavefrontPathIntegrator::WavefrontPathIntegrator(
         CHECK(mr);
         aggregate = new OptiXAggregate(scene, mr, textures, shapeIndexToAreaLights, media,
                                        namedMaterials, materials,
-                                       std::move(preloadedPlyMeshes));
+                                       std::move(preloadedPlyMeshes),
+                                       Options->useGPU ? &optixInitBundle : nullptr);
 #else
         LOG_FATAL("Options->useGPU was set without PBRT_BUILD_GPU_RENDERER enabled");
 #endif

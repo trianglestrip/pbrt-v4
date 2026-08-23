@@ -27,15 +27,46 @@
 
 namespace pbrt {
 
+// All OptiX state that must exist before any scene geometry is built.  It has
+// no dependency on textures or materials, so it can be created on a background
+// thread and overlapped with texture creation.  The SBT records store GPU
+// pointers and remain valid after the bundle is moved into the aggregate.
+struct OptiXInitBundle {
+    OptixDeviceContext optixContext = nullptr;
+    OptixModule optixModule = nullptr;
+    OptixProgramGroup raygenPGClosest = nullptr, missPGNoOp = nullptr,
+                     hitPGTriangle = nullptr, hitPGBilinearPatch = nullptr,
+                     hitPGQuadric = nullptr;
+    OptixProgramGroup raygenPGShadow = nullptr, missPGShadow = nullptr,
+                     anyhitPGShadowTriangle = nullptr;
+    OptixProgramGroup raygenPGShadowTr = nullptr, missPGShadowTr = nullptr;
+    OptixProgramGroup anyhitPGShadowBilinearPatch = nullptr,
+                     anyhitPGShadowQuadric = nullptr;
+    OptixProgramGroup raygenPGRandomHit = nullptr, hitPGRandomHitTriangle = nullptr,
+                     hitPGRandomHitBilinearPatch = nullptr,
+                     hitPGRandomHitQuadric = nullptr;
+    OptixPipeline optixPipeline = nullptr;
+};
+
 class OptiXAggregate : public WavefrontAggregate {
   public:
+    // If initBundle is provided it is consumed (moved from); otherwise OptiX
+    // is initialized here.  Passing a bundle lets the caller overlap OptiX
+    // initialization with texture creation on a background thread.
     OptiXAggregate(const BasicScene &scene, CUDATrackedMemoryResource *memoryResource,
                    NamedTextures &textures,
                    const std::map<int, pstd::vector<Light> *> &shapeIndexToAreaLights,
                    const std::map<std::string, Medium> &media,
                    const std::map<std::string, pbrt::Material> &namedMaterials,
                    const std::vector<pbrt::Material> &materials,
-                   std::map<int, TriQuadMesh> preloadedPlyMeshes = {});
+                   std::map<int, TriQuadMesh> preloadedPlyMeshes = {},
+                   OptiXInitBundle *initBundle = nullptr);
+
+    // Creates everything in OptiXInitBundle.  optixInit() + device context +
+    // module + program groups + pipeline + raygen/miss SBT records.  Safe to
+    // call from a background thread (the caller must have pushed the CUDA
+    // context with cuCtxSetCurrent first).
+    static OptiXInitBundle CreateOptiXBundle(CUcontext cudaContext);
 
     Bounds3f Bounds() const { return bounds; }
 
@@ -147,13 +178,19 @@ class OptiXAggregate : public WavefrontAggregate {
     int addHGRecords(const BVH &bvh);
 
     static OptixModule createOptiXModule(OptixDeviceContext optixContext,
-                                         const char *ptx);
+                                          const char *ptx);
     static OptixPipelineCompileOptions getPipelineCompileOptions();
-
-    OptixProgramGroup createRaygenPG(const char *entrypoint) const;
-    OptixProgramGroup createMissPG(const char *entrypoint) const;
-    OptixProgramGroup createIntersectionPG(const char *closest, const char *any,
-                                           const char *intersect) const;
+    static OptixProgramGroup createRaygenPG(OptixDeviceContext optixContext,
+                                            OptixModule optixModule,
+                                            const char *entrypoint);
+    static OptixProgramGroup createMissPG(OptixDeviceContext optixContext,
+                                          OptixModule optixModule,
+                                          const char *entrypoint);
+    static OptixProgramGroup createIntersectionPG(OptixDeviceContext optixContext,
+                                                  OptixModule optixModule,
+                                                  const char *closest,
+                                                  const char *any,
+                                                  const char *intersect);
 
     static OptixTraversableHandle buildOptixBVH(
         OptixDeviceContext optixContext, const std::vector<OptixBuildInput> &buildInputs,

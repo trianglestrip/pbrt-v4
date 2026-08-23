@@ -1305,7 +1305,9 @@ OptixModule OptiXAggregate::createOptiXModule(OptixDeviceContext optixContext,
     return optixModule;
 }
 
-OptixProgramGroup OptiXAggregate::createRaygenPG(const char *entrypoint) const {
+OptixProgramGroup OptiXAggregate::createRaygenPG(OptixDeviceContext optixContext,
+                                                  OptixModule optixModule,
+                                                  const char *entrypoint) {
     OptixProgramGroupOptions pgOptions = {};
     OptixProgramGroupDesc desc = {};
     desc.kind = OPTIX_PROGRAM_GROUP_KIND_RAYGEN;
@@ -1323,7 +1325,9 @@ OptixProgramGroup OptiXAggregate::createRaygenPG(const char *entrypoint) const {
     return pg;
 }
 
-OptixProgramGroup OptiXAggregate::createMissPG(const char *entrypoint) const {
+OptixProgramGroup OptiXAggregate::createMissPG(OptixDeviceContext optixContext,
+                                               OptixModule optixModule,
+                                               const char *entrypoint) {
     OptixProgramGroupOptions pgOptions = {};
     OptixProgramGroupDesc desc = {};
     desc.kind = OPTIX_PROGRAM_GROUP_KIND_MISS;
@@ -1341,9 +1345,11 @@ OptixProgramGroup OptiXAggregate::createMissPG(const char *entrypoint) const {
     return pg;
 }
 
-OptixProgramGroup OptiXAggregate::createIntersectionPG(const char *closest,
-                                                       const char *any,
-                                                       const char *intersect) const {
+OptixProgramGroup OptiXAggregate::createIntersectionPG(OptixDeviceContext optixContext,
+                                                        OptixModule optixModule,
+                                                        const char *closest,
+                                                        const char *any,
+                                                        const char *intersect) {
     OptixProgramGroupOptions pgOptions = {};
     OptixProgramGroupDesc desc = {};
     desc.kind = OPTIX_PROGRAM_GROUP_KIND_HITGROUP;
@@ -1372,6 +1378,115 @@ OptixProgramGroup OptiXAggregate::createIntersectionPG(const char *closest,
     return pg;
 }
 
+OptiXInitBundle OptiXAggregate::CreateOptiXBundle(CUcontext cudaContext) {
+    OptiXInitBundle bundle;
+    LOG_VERBOSE("Starting OptiX initialization");
+    OPTIX_CHECK(optixInit());
+    OptixDeviceContextOptions ctxOptions = {};
+#ifndef NDEBUG
+    ctxOptions.logCallbackLevel = 4;  // status/progress
+#else
+    ctxOptions.logCallbackLevel = 2;  // error
+#endif
+    ctxOptions.logCallbackFunction = logCallback;
+#if (OPTIX_VERSION >= 70200) && !defined(NDEBUG)
+    ctxOptions.validationMode = OPTIX_DEVICE_CONTEXT_VALIDATION_MODE_ALL;
+#endif
+    OPTIX_CHECK(optixDeviceContextCreate(cudaContext, &ctxOptions, &bundle.optixContext));
+
+    LOG_VERBOSE("Optix version %d.%d.%d successfully initialized", OPTIX_VERSION / 10000,
+                (OPTIX_VERSION % 10000) / 100, OPTIX_VERSION % 100);
+
+    bundle.optixModule =
+        createOptiXModule(bundle.optixContext, (const char *)PBRT_EMBEDDED_PTX);
+
+    bundle.raygenPGClosest =
+        createRaygenPG(bundle.optixContext, bundle.optixModule, "__raygen__findClosest");
+    bundle.missPGNoOp =
+        createMissPG(bundle.optixContext, bundle.optixModule, "__miss__noop");
+    bundle.hitPGTriangle = createIntersectionPG(bundle.optixContext, bundle.optixModule,
+                                                "__closesthit__triangle", "__anyhit__triangle",
+                                                nullptr);
+    bundle.hitPGBilinearPatch = createIntersectionPG(
+        bundle.optixContext, bundle.optixModule, "__closesthit__bilinearPatch", nullptr,
+        "__intersection__bilinearPatch");
+    bundle.hitPGQuadric = createIntersectionPG(bundle.optixContext, bundle.optixModule,
+                                               "__closesthit__quadric", nullptr,
+                                               "__intersection__quadric");
+
+    bundle.raygenPGShadow =
+        createRaygenPG(bundle.optixContext, bundle.optixModule, "__raygen__shadow");
+    bundle.missPGShadow =
+        createMissPG(bundle.optixContext, bundle.optixModule, "__miss__shadow");
+    bundle.anyhitPGShadowTriangle = createIntersectionPG(
+        bundle.optixContext, bundle.optixModule, nullptr, "__anyhit__shadowTriangle", nullptr);
+
+    bundle.raygenPGShadowTr =
+        createRaygenPG(bundle.optixContext, bundle.optixModule, "__raygen__shadow_Tr");
+    bundle.missPGShadowTr =
+        createMissPG(bundle.optixContext, bundle.optixModule, "__miss__shadow_Tr");
+
+    bundle.anyhitPGShadowBilinearPatch = createIntersectionPG(
+        bundle.optixContext, bundle.optixModule, nullptr, "__anyhit__shadowBilinearPatch",
+        "__intersection__bilinearPatch");
+    bundle.anyhitPGShadowQuadric = createIntersectionPG(
+        bundle.optixContext, bundle.optixModule, nullptr, "__anyhit__shadowQuadric",
+        "__intersection__quadric");
+
+    bundle.raygenPGRandomHit =
+        createRaygenPG(bundle.optixContext, bundle.optixModule, "__raygen__randomHit");
+    bundle.hitPGRandomHitTriangle = createIntersectionPG(
+        bundle.optixContext, bundle.optixModule, "__closesthit__randomHitTriangle", nullptr,
+        nullptr);
+    bundle.hitPGRandomHitBilinearPatch = createIntersectionPG(
+        bundle.optixContext, bundle.optixModule, "__closesthit__randomHitBilinearPatch",
+        nullptr, "__intersection__bilinearPatch");
+    bundle.hitPGRandomHitQuadric = createIntersectionPG(
+        bundle.optixContext, bundle.optixModule, "__closesthit__randomHitQuadric", nullptr,
+        "__intersection__quadric");
+
+    OptixProgramGroup allPGs[] = {bundle.raygenPGClosest,
+                                  bundle.missPGNoOp,
+                                  bundle.hitPGTriangle,
+                                  bundle.hitPGBilinearPatch,
+                                  bundle.hitPGQuadric,
+                                  bundle.raygenPGShadow,
+                                  bundle.missPGShadow,
+                                  bundle.anyhitPGShadowTriangle,
+                                  bundle.anyhitPGShadowBilinearPatch,
+                                  bundle.anyhitPGShadowQuadric,
+                                  bundle.raygenPGShadowTr,
+                                  bundle.missPGShadowTr,
+                                  bundle.raygenPGRandomHit,
+                                  bundle.hitPGRandomHitTriangle,
+                                  bundle.hitPGRandomHitBilinearPatch,
+                                  bundle.hitPGRandomHitQuadric};
+
+    OptixPipelineCompileOptions pipelineCompileOptions = getPipelineCompileOptions();
+
+    OptixPipelineLinkOptions pipelineLinkOptions = {};
+    pipelineLinkOptions.maxTraceDepth = 2;
+#if (OPTIX_VERSION < 70700)
+#ifndef NDEBUG
+    pipelineLinkOptions.debugLevel = OPTIX_COMPILE_DEBUG_LEVEL_FULL;
+#else
+    pipelineLinkOptions.debugLevel = OPTIX_COMPILE_DEBUG_LEVEL_NONE;
+#endif
+#endif  // OPTIX_VERSION
+
+    char log[4096];
+    size_t logSize = sizeof(log);
+    OPTIX_CHECK_WITH_LOG(
+        optixPipelineCreate(bundle.optixContext, &pipelineCompileOptions, &pipelineLinkOptions,
+                            allPGs, sizeof(allPGs) / sizeof(allPGs[0]), log, &logSize,
+                            &bundle.optixPipeline),
+        log);
+    LOG_VERBOSE("%s", log);
+
+    LOG_VERBOSE("Finished OptiX initialization");
+    return bundle;
+}
+
 OptiXAggregate::OptiXAggregate(
     const BasicScene &scene, CUDATrackedMemoryResource *memoryResource,
     NamedTextures &textures,
@@ -1379,12 +1494,10 @@ OptiXAggregate::OptiXAggregate(
     const std::map<std::string, Medium> &media,
     const std::map<std::string, pbrt::Material> &namedMaterials,
     const std::vector<pbrt::Material> &materials,
-    std::map<int, TriQuadMesh> preloadedPlyMeshes)
+    std::map<int, TriQuadMesh> preloadedPlyMeshes,
+    OptiXInitBundle *initBundle)
     : memoryResource(memoryResource), cudaStream(nullptr) {
     auto initStart = std::chrono::high_resolution_clock::now();
-    CUcontext cudaContext;
-    CU_CHECK(cuCtxGetCurrent(&cudaContext));
-    CHECK(cudaContext != nullptr);
 
 #ifdef PBRT_IS_WINDOWS
     // On Windows, it is unfortunately necessary to disable
@@ -1413,111 +1526,42 @@ OptiXAggregate::OptiXAggregate(
         CUDA_CHECK(cudaMallocHost(&ps.hostPtr, sizeof(RayIntersectParameters)));
     }
 
-    // Create OptiX context
-    LOG_VERBOSE("Starting OptiX initialization");
-    OPTIX_CHECK(optixInit());
-    OptixDeviceContextOptions ctxOptions = {};
-#ifndef NDEBUG
-    ctxOptions.logCallbackLevel = 4;  // status/progress
-#else
-    ctxOptions.logCallbackLevel = 2;  // error
-#endif
-    ctxOptions.logCallbackFunction = logCallback;
-#if (OPTIX_VERSION >= 70200) && !defined(NDEBUG)
-    ctxOptions.validationMode = OPTIX_DEVICE_CONTEXT_VALIDATION_MODE_ALL;
-#endif
-    OPTIX_CHECK(optixDeviceContextCreate(cudaContext, &ctxOptions, &optixContext));
+    // Initialize OptiX either from a prebuilt bundle (created on a background
+    // thread, overlapped with texture creation) or right here if none was
+    // supplied.
+    OptiXInitBundle bundle;
+    if (initBundle) {
+        bundle = std::move(*initBundle);
+        LOG_VERBOSE("Using prebuilt OptiX init bundle");
+    } else {
+        CUcontext cudaContext;
+        CU_CHECK(cuCtxGetCurrent(&cudaContext));
+        CHECK(cudaContext != nullptr);
+        bundle = CreateOptiXBundle(cudaContext);
+    }
+    optixContext = bundle.optixContext;
+    optixModule = bundle.optixModule;
+    optixPipeline = bundle.optixPipeline;
 
-    LOG_VERBOSE("Optix version %d.%d.%d successfully initialized", OPTIX_VERSION / 10000,
-                (OPTIX_VERSION % 10000) / 100, OPTIX_VERSION % 100);
+    OptixProgramGroup raygenPGClosest = bundle.raygenPGClosest;
+    OptixProgramGroup missPGNoOp = bundle.missPGNoOp;
+    OptixProgramGroup hitPGTriangle = bundle.hitPGTriangle;
+    OptixProgramGroup hitPGBilinearPatch = bundle.hitPGBilinearPatch;
+    OptixProgramGroup hitPGQuadric = bundle.hitPGQuadric;
+    OptixProgramGroup raygenPGShadow = bundle.raygenPGShadow;
+    OptixProgramGroup missPGShadow = bundle.missPGShadow;
+    OptixProgramGroup anyhitPGShadowTriangle = bundle.anyhitPGShadowTriangle;
+    OptixProgramGroup raygenPGShadowTr = bundle.raygenPGShadowTr;
+    OptixProgramGroup missPGShadowTr = bundle.missPGShadowTr;
+    OptixProgramGroup anyhitPGShadowBilinearPatch = bundle.anyhitPGShadowBilinearPatch;
+    OptixProgramGroup anyhitPGShadowQuadric = bundle.anyhitPGShadowQuadric;
+    OptixProgramGroup raygenPGRandomHit = bundle.raygenPGRandomHit;
+    OptixProgramGroup hitPGRandomHitTriangle = bundle.hitPGRandomHitTriangle;
+    OptixProgramGroup hitPGRandomHitBilinearPatch = bundle.hitPGRandomHitBilinearPatch;
+    OptixProgramGroup hitPGRandomHitQuadric = bundle.hitPGRandomHitQuadric;
 
-    // OptiX module
-    optixModule = createOptiXModule(optixContext, (const char *)PBRT_EMBEDDED_PTX);
-
-    // Optix program groups...
-    char log[4096];
-    size_t logSize = sizeof(log);
-
-    OptixProgramGroup raygenPGClosest = createRaygenPG("__raygen__findClosest");
-    OptixProgramGroup missPGNoOp = createMissPG("__miss__noop");
-    OptixProgramGroup hitPGTriangle =
-        createIntersectionPG("__closesthit__triangle", "__anyhit__triangle", nullptr);
-    OptixProgramGroup hitPGBilinearPatch = createIntersectionPG(
-        "__closesthit__bilinearPatch", nullptr, "__intersection__bilinearPatch");
-    OptixProgramGroup hitPGQuadric =
-        createIntersectionPG("__closesthit__quadric", nullptr, "__intersection__quadric");
-
-    OptixProgramGroup raygenPGShadow = createRaygenPG("__raygen__shadow");
-    OptixProgramGroup missPGShadow = createMissPG("__miss__shadow");
-    OptixProgramGroup anyhitPGShadowTriangle =
-        createIntersectionPG(nullptr, "__anyhit__shadowTriangle", nullptr);
-
-    OptixProgramGroup raygenPGShadowTr = createRaygenPG("__raygen__shadow_Tr");
-    OptixProgramGroup missPGShadowTr = createMissPG("__miss__shadow_Tr");
-
-    OptixProgramGroup anyhitPGShadowBilinearPatch = createIntersectionPG(
-        nullptr, "__anyhit__shadowBilinearPatch", "__intersection__bilinearPatch");
-    OptixProgramGroup anyhitPGShadowQuadric = createIntersectionPG(
-        nullptr, "__anyhit__shadowQuadric", "__intersection__quadric");
-
-    OptixProgramGroup raygenPGRandomHit = createRaygenPG("__raygen__randomHit");
-    OptixProgramGroup hitPGRandomHitTriangle =
-        createIntersectionPG("__closesthit__randomHitTriangle", nullptr, nullptr);
-    OptixProgramGroup hitPGRandomHitBilinearPatch = createIntersectionPG(
-        "__closesthit__randomHitBilinearPatch", nullptr, "__intersection__bilinearPatch");
-    OptixProgramGroup hitPGRandomHitQuadric = createIntersectionPG(
-        "__closesthit__randomHitQuadric", nullptr, "__intersection__quadric");
-
-    // Optix pipeline...
-    OptixProgramGroup allPGs[] = {raygenPGClosest,
-                                  missPGNoOp,
-                                  hitPGTriangle,
-                                  hitPGBilinearPatch,
-                                  hitPGQuadric,
-                                  raygenPGShadow,
-                                  missPGShadow,
-                                  anyhitPGShadowTriangle,
-                                  anyhitPGShadowBilinearPatch,
-                                  anyhitPGShadowQuadric,
-                                  raygenPGShadowTr,
-                                  missPGShadowTr,
-                                  raygenPGRandomHit,
-                                  hitPGRandomHitTriangle,
-                                  hitPGRandomHitBilinearPatch,
-                                  hitPGRandomHitQuadric};
-
-    OptixPipelineCompileOptions pipelineCompileOptions = getPipelineCompileOptions();
-
-    OptixPipelineLinkOptions pipelineLinkOptions = {};
-    pipelineLinkOptions.maxTraceDepth = 2;
-#if (OPTIX_VERSION < 70700)
-#ifndef NDEBUG
-    pipelineLinkOptions.debugLevel = OPTIX_COMPILE_DEBUG_LEVEL_FULL;
-#else
-    pipelineLinkOptions.debugLevel = OPTIX_COMPILE_DEBUG_LEVEL_NONE;
-#endif
-#endif // OPTIX_VERSION
-
-    OPTIX_CHECK_WITH_LOG(
-        optixPipelineCreate(optixContext, &pipelineCompileOptions, &pipelineLinkOptions,
-                            allPGs, sizeof(allPGs) / sizeof(allPGs[0]), log, &logSize,
-                            &optixPipeline),
-        log);
-    LOG_VERBOSE("%s", log);
-
-#if 0
-    OPTIX_CHECK(optixPipelineSetStackSize(
-        optixPipeline,
-        0, /* direct callables from intersect or any-hit */
-        0, /* direct callables from raygen, miss, or closest hit */
-        4 * 1024, /* continuation stack */
-        2 /* max graph depth. NOTE: this is 3 when we have motion xforms... */));
-#endif
-
-    // Shader binding tables...
-    // Hitgroups are done as meshes are processed
-
-    // Closest intersection
+    // Shader binding tables (raygen/miss records).  Allocated on the aggregate's
+    // memory resource so they stay valid for the lifetime of the aggregate.
     Allocator alloc(memoryResource);
     RaygenRecord *raygenClosestRecord = alloc.new_object<RaygenRecord>();
     OPTIX_CHECK(optixSbtRecordPackHeader(raygenPGClosest, raygenClosestRecord));
@@ -1529,7 +1573,6 @@ OptiXAggregate::OptiXAggregate(
     intersectSBT.missRecordStrideInBytes = sizeof(MissRecord);
     intersectSBT.missRecordCount = 1;
 
-    // Shadow
     RaygenRecord *raygenShadowRecord = alloc.new_object<RaygenRecord>();
     OPTIX_CHECK(optixSbtRecordPackHeader(raygenPGShadow, raygenShadowRecord));
     shadowSBT.raygenRecord = (CUdeviceptr)raygenShadowRecord;
@@ -1540,7 +1583,6 @@ OptiXAggregate::OptiXAggregate(
     shadowSBT.missRecordStrideInBytes = sizeof(MissRecord);
     shadowSBT.missRecordCount = 1;
 
-    // Shadow + Tr
     RaygenRecord *raygenShadowTrRecord = alloc.new_object<RaygenRecord>();
     OPTIX_CHECK(optixSbtRecordPackHeader(raygenPGShadowTr, raygenShadowTrRecord));
     shadowTrSBT.raygenRecord = (CUdeviceptr)raygenShadowTrRecord;
@@ -1551,7 +1593,6 @@ OptiXAggregate::OptiXAggregate(
     shadowTrSBT.missRecordStrideInBytes = sizeof(MissRecord);
     shadowTrSBT.missRecordCount = 1;
 
-    // Random hit
     RaygenRecord *raygenRandomHitRecord = alloc.new_object<RaygenRecord>();
     OPTIX_CHECK(optixSbtRecordPackHeader(raygenPGRandomHit, raygenRandomHitRecord));
     randomHitSBT.raygenRecord = (CUdeviceptr)raygenRandomHitRecord;

@@ -315,6 +315,19 @@ texture pipeline: `wpi-CreateTextures` (~10–12 s) + `texture-upload`
 (12–39 s, load-dependent). The OptiX/mesh side is only ~2–4 s when cores are
 free, so it is no longer on the wall-critical path.
 
+Controlled re-measurement (Windhawk injection disabled, ~6.4 GB RAM free),
+four consecutive runs of `bistro_cafe_quick`:
+
+```
+gpu-build+upload+bvh : 26.7 / 25.9 / 46.6* / 25.6 s   (render-total 28.7/28.3/48.8/27.5)
+wpi-CreateTextures   : 12.4 / 12.7 / 18.8* / 12.4 s
+texture-upload       : 12.4 / 12.5 / 27.0* / 12.4 s
+```
+
+\* run 3 caught a transient load spike. Stable median **~26 s**, consistent
+with the best-of runs above and confirming no regression from the
+static-deflate submodule patches.
+
 ## How to render
 
 ```bat

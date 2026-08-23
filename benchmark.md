@@ -403,6 +403,23 @@ baseline.  The win is modest because per-texture work is small and this
 machine has +-5 s variance; texture-heavy scenes benefit more.
 Output pixel-identical (imgtool diff MAE == 0).
 
+
+## High-SPP reference: 640x360 @ 64 spp
+
+Rendered istro_cafe_quick.pbrt --gpu --spp 64 (3 clean runs, exit 0):
+
+```
+render-total        49.9 / 46.1 / 45.0 s   (median ~46 s)
+gpu-build+upload    46.0 / 43.7 / 42.8 s
+optix-ctor-total    ~13.5 s   (meshCreate ~10.6 dominates)
+wpi-CreateTextures  5-10 s    (machine-load dependent)
+texture-upload      ~13 s     (147 unique textures, hidden behind ctor)
+```
+
+Compared to the 8 spp quick baseline (~24-32 s wall), 64 spp adds roughly
+17 s of pure sampling (8x the rays), i.e. startup remains ~25-28 s and the
+rest is sample time scaling linearly with spp as expected.
+
 ## How to render
 
 ```bat

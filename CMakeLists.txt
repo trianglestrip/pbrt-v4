@@ -1002,6 +1002,19 @@ set_target_properties (pbrt_exe PROPERTIES OUTPUT_NAME pbrt)
 
 add_sanitizers (pbrt_exe)
 
+######################
+## pbrt_parseprobe
+
+# Probe that calls pbrt's parser library directly with a custom ParserTarget, to
+# verify the parser is event-driven.  Not part of the normal build pipeline.
+add_executable (pbrt_parseprobe src/pbrt/cmd/parse_probe.cpp)
+add_executable (pbrt::pbrt_parseprobe ALIAS pbrt_parseprobe)
+
+target_compile_definitions (pbrt_parseprobe PRIVATE ${PBRT_DEFINITIONS})
+target_compile_options (pbrt_parseprobe PRIVATE ${PBRT_CXX_FLAGS})
+target_include_directories (pbrt_parseprobe PRIVATE src src/ext)
+target_link_libraries (pbrt_parseprobe PRIVATE ${ALL_PBRT_LIBS} pbrt_opt pbrt_warnings)
+
 set_property (TARGET pbrt_exe PROPERTY FOLDER "cmd")
 
 ######################

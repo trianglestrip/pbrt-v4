@@ -34,7 +34,8 @@ class OptiXAggregate : public WavefrontAggregate {
                    const std::map<int, pstd::vector<Light> *> &shapeIndexToAreaLights,
                    const std::map<std::string, Medium> &media,
                    const std::map<std::string, pbrt::Material> &namedMaterials,
-                   const std::vector<pbrt::Material> &materials);
+                   const std::vector<pbrt::Material> &materials,
+                   std::map<int, TriQuadMesh> preloadedPlyMeshes = {});
 
     Bounds3f Bounds() const { return bounds; }
 
@@ -61,6 +62,27 @@ class OptiXAggregate : public WavefrontAggregate {
     static std::map<int, TriQuadMesh> PreparePLYMeshes(
         const std::vector<ShapeSceneEntity> &shapes,
         const std::map<std::string, FloatTexture> &floatTextures);
+
+    // Load (and quad->tri convert) PLY meshes without evaluating displacement
+    // textures.  Pure CPU work with no dependency on NamedTextures, so it can
+    // run on a background thread concurrently with texture creation.  Returns
+    // the loaded meshes plus the indices of shapes whose "displacement"
+    // parameter must be resolved later via ApplyPLYDisplacements().
+    struct LoadedPlyMeshes {
+        std::map<int, TriQuadMesh> meshes;
+        std::vector<int> displacedIndices;
+    };
+    static LoadedPlyMeshes PreparePLYMeshesLoadOnly(
+        const std::vector<ShapeSceneEntity> &shapes);
+
+    // Applies displacement to the meshes recorded by PreparePLYMeshesLoadOnly.
+    // Must be called after texture creation (needs floatTextures) and before
+    // OptiXAggregate construction.  GPU-synchronous.
+    static void ApplyPLYDisplacements(
+        const std::vector<ShapeSceneEntity> &shapes,
+        const std::vector<int> &displacedIndices,
+        const std::map<std::string, FloatTexture> &floatTextures,
+        std::map<int, TriQuadMesh> *meshes);
 
   private:
     struct HitgroupRecord;

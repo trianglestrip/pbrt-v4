@@ -117,7 +117,26 @@ WavefrontPathIntegrator::WavefrontPathIntegrator(
                 haveMedia = true;
     }
 
-    // Textures
+    // Task-graph branch 1 (background): PLY loading is pure CPU work with no
+    // dependency on textures/lights/materials, so start it now and let it run
+    // concurrently with texture creation on the main thread.
+#ifdef PBRT_BUILD_GPU_RENDERER
+    std::map<int, TriQuadMesh> preloadedPlyMeshes;
+    std::vector<int> displacedPlyIndices;
+    std::thread plyPrepThread;
+    if (Options->useGPU) {
+        auto plyPrepStart = std::chrono::high_resolution_clock::now();
+        plyPrepThread = std::thread([&]() {
+            OptiXAggregate::LoadedPlyMeshes loaded =
+                OptiXAggregate::PreparePLYMeshesLoadOnly(scene.shapes);
+            preloadedPlyMeshes = std::move(loaded.meshes);
+            displacedPlyIndices = std::move(loaded.displacedIndices);
+        });
+        Printf("STAGE_TIMING [ply-preload] started in background\n");
+    }
+#endif
+
+    // Task-graph branch 2 (main thread): textures -> lights -> materials.
     LOG_VERBOSE("Starting to create textures");
     auto tt0 = std::chrono::high_resolution_clock::now();
     NamedTextures textures = scene.CreateTextures();
@@ -158,6 +177,19 @@ WavefrontPathIntegrator::WavefrontPathIntegrator(
            std::chrono::duration<double>(std::chrono::high_resolution_clock::now() -
                                           wpiStart)
                .count());
+
+#ifdef PBRT_BUILD_GPU_RENDERER
+    if (plyPrepThread.joinable()) {
+        plyPrepThread.join();
+        // Displacement needs float textures; apply it now (GPU-synchronous).
+        OptiXAggregate::ApplyPLYDisplacements(scene.shapes, displacedPlyIndices,
+                                              textures.floatTextures,
+                                              &preloadedPlyMeshes);
+        Printf("STAGE_TIMING [ply-preload] ready (%zu meshes)\n",
+               preloadedPlyMeshes.size());
+    }
+#endif
+
     auto wpiPostStart = std::chrono::high_resolution_clock::now();
 
     // Deferred GPU texture uploads: kick them off on a background thread so
@@ -197,7 +229,8 @@ WavefrontPathIntegrator::WavefrontPathIntegrator(
             dynamic_cast<CUDATrackedMemoryResource *>(memoryResource);
         CHECK(mr);
         aggregate = new OptiXAggregate(scene, mr, textures, shapeIndexToAreaLights, media,
-                                       namedMaterials, materials);
+                                       namedMaterials, materials,
+                                       std::move(preloadedPlyMeshes));
 #else
         LOG_FATAL("Options->useGPU was set without PBRT_BUILD_GPU_RENDERER enabled");
 #endif

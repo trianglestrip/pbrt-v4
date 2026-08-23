@@ -306,6 +306,73 @@ static MediumInterface *getMediumInterface(const ShapeSceneEntity &shape,
 
 STAT_COUNTER("Geometry/Triangles added from displacement mapping", displacedTrisDelta);
 
+namespace {
+// Evaluates the "displacement" parameter of a plymesh (if any) against
+// //texture/floatTextures and displaces *plyMesh on the GPU.  No-op when the
+// shape has no displacement texture.
+void DisplaceOnePlyMesh(const ShapeSceneEntity &shape, TriQuadMesh *plyMesh,
+                        const std::map<std::string, FloatTexture> &floatTextures) {
+    std::string displacementTexName = shape.parameters.GetTexture("displacement");
+    if (displacementTexName.empty())
+        return;
+
+    auto iter = floatTextures.find(displacementTexName);
+    if (iter == floatTextures.end())
+        ErrorExit(&shape.loc, "%s: no such texture defined.", displacementTexName);
+    FloatTexture displacement = iter->second;
+
+    LOG_VERBOSE("Starting to displace mesh with \"%s\"", displacementTexName);
+
+    size_t origNumTris = plyMesh->triIndices.size() / 3;
+
+    Float edgeLength = shape.parameters.GetOneFloat("edgelength", 1.f);
+    edgeLength *= Options->displacementEdgeScale;
+
+    *plyMesh = plyMesh->Displace(
+        [&](Point3f v0, Point3f v1) {
+            v0 = (*shape.renderFromObject)(v0);
+            v1 = (*shape.renderFromObject)(v1);
+            return Distance(v0, v1);
+        },
+        edgeLength,
+        [&](Point3f *pCPU, const Normal3f *nCPU, const Point2f *uvCPU,
+            int nVertices) {
+            Point3f *p;
+            Normal3f *n;
+            Point2f *uv;
+            CUDA_CHECK(cudaMallocManaged(&p, nVertices * sizeof(Point3f)));
+            CUDA_CHECK(cudaMallocManaged(&n, nVertices * sizeof(Normal3f)));
+            CUDA_CHECK(cudaMallocManaged(&uv, nVertices * sizeof(Point2f)));
+
+            std::memcpy(p, pCPU, nVertices * sizeof(Point3f));
+            std::memcpy(n, nCPU, nVertices * sizeof(Normal3f));
+            std::memcpy(uv, uvCPU, nVertices * sizeof(Point2f));
+
+            GPUParallelFor(
+                "Evaluate Displacement", nVertices, [=] PBRT_GPU(int i) {
+                    TextureEvalContext ctx;
+                    ctx.p = p[i];
+                    ctx.uv = uv[i];
+                    Float d = UniversalTextureEvaluator()(displacement, ctx);
+                    p[i] += Vector3f(d * n[i]);
+                });
+            GPUWait();
+
+            std::memcpy(pCPU, p, nVertices * sizeof(Point3f));
+
+            CUDA_CHECK(cudaFree(p));
+            CUDA_CHECK(cudaFree(n));
+            CUDA_CHECK(cudaFree(uv));
+        },
+        &shape.loc);
+
+    displacedTrisDelta += plyMesh->triIndices.size() / 3 - origNumTris;
+
+    LOG_VERBOSE("Finished displacing mesh -> %d tris",
+                plyMesh->triIndices.size() / 3);
+}
+}  // namespace
+
 std::map<int, TriQuadMesh> OptiXAggregate::PreparePLYMeshes(
     const std::vector<ShapeSceneEntity> &shapes,
     const std::map<std::string, FloatTexture> &floatTextures) {
@@ -323,67 +390,7 @@ std::map<int, TriQuadMesh> OptiXAggregate::PreparePLYMeshes(
         TriQuadMesh plyMesh = TriQuadMesh::ReadPLY(filename);  // todo: alloc
         if (!plyMesh.triIndices.empty() || !plyMesh.quadIndices.empty()) {
             plyMesh.ConvertToOnlyTriangles();
-
-            Float edgeLength =
-                shape.parameters.GetOneFloat("edgelength", 1.f);
-            edgeLength *= Options->displacementEdgeScale;
-
-            std::string displacementTexName = shape.parameters.GetTexture("displacement");
-            if (!displacementTexName.empty()) {
-                auto iter = floatTextures.find(displacementTexName);
-                if (iter == floatTextures.end())
-                    ErrorExit(&shape.loc, "%s: no such texture defined.",
-                              displacementTexName);
-                FloatTexture displacement = iter->second;
-
-                LOG_VERBOSE("Starting to displace mesh \"%s\" with \"%s\"", filename,
-                            displacementTexName);
-
-                size_t origNumTris = plyMesh.triIndices.size() / 3;
-
-                plyMesh = plyMesh.Displace(
-                    [&](Point3f v0, Point3f v1) {
-                        v0 = (*shape.renderFromObject)(v0);
-                        v1 = (*shape.renderFromObject)(v1);
-                        return Distance(v0, v1);
-                    },
-                    edgeLength,
-                    [&](Point3f *pCPU, const Normal3f *nCPU, const Point2f *uvCPU,
-                        int nVertices) {
-                        Point3f *p;
-                        Normal3f *n;
-                        Point2f *uv;
-                        CUDA_CHECK(cudaMallocManaged(&p, nVertices * sizeof(Point3f)));
-                        CUDA_CHECK(cudaMallocManaged(&n, nVertices * sizeof(Normal3f)));
-                        CUDA_CHECK(cudaMallocManaged(&uv, nVertices * sizeof(Point2f)));
-
-                        std::memcpy(p, pCPU, nVertices * sizeof(Point3f));
-                        std::memcpy(n, nCPU, nVertices * sizeof(Normal3f));
-                        std::memcpy(uv, uvCPU, nVertices * sizeof(Point2f));
-
-                        GPUParallelFor(
-                            "Evaluate Displacement", nVertices, [=] PBRT_GPU(int i) {
-                                TextureEvalContext ctx;
-                                ctx.p = p[i];
-                                ctx.uv = uv[i];
-                                Float d = UniversalTextureEvaluator()(displacement, ctx);
-                                p[i] += Vector3f(d * n[i]);
-                            });
-                        GPUWait();
-
-                        std::memcpy(pCPU, p, nVertices * sizeof(Point3f));
-
-                        CUDA_CHECK(cudaFree(p));
-                        CUDA_CHECK(cudaFree(n));
-                        CUDA_CHECK(cudaFree(uv));
-                    },
-                    &shape.loc);
-
-                displacedTrisDelta += plyMesh.triIndices.size() / 3 - origNumTris;
-
-                LOG_VERBOSE("Finished displacing mesh \"%s\" with \"%s\" -> %d tris",
-                            filename, displacementTexName, plyMesh.triIndices.size() / 3);
-            }
+            DisplaceOnePlyMesh(shape, &plyMesh, floatTextures);
         }
 
         std::lock_guard<std::mutex> lock(mutex);
@@ -391,6 +398,53 @@ std::map<int, TriQuadMesh> OptiXAggregate::PreparePLYMeshes(
     });
 
     return plyMeshes;
+}
+
+OptiXAggregate::LoadedPlyMeshes OptiXAggregate::PreparePLYMeshesLoadOnly(
+    const std::vector<ShapeSceneEntity> &shapes) {
+    LoadedPlyMeshes result;
+    std::mutex mutex;
+    // Real parallelism: unlike PreparePLYMeshes (which runs under
+    // DisableThreadPool inside the ctor), this executes before the pool is
+    // disabled, so use the manual pool for concurrent PLY reads/decodes.
+    ParallelForManual(int64_t(shapes.size()), [&](int64_t i) {
+        const auto &shape = shapes[i];
+        if (shape.name != "plymesh")
+            return;
+
+        std::string filename =
+            ResolveFilename(shape.parameters.GetOneString("filename", ""));
+        if (filename.empty())
+            ErrorExit(&shape.loc, "plymesh: \"filename\" must be provided.");
+        TriQuadMesh plyMesh = TriQuadMesh::ReadPLY(filename);  // todo: alloc
+        bool displaced = false;
+        if (!plyMesh.triIndices.empty() || !plyMesh.quadIndices.empty()) {
+            plyMesh.ConvertToOnlyTriangles();
+            // Displacement needs float textures, which do not exist yet --
+            // defer it to ApplyPLYDisplacements().
+            displaced = !shape.parameters.GetTexture("displacement").empty();
+        }
+
+        std::lock_guard<std::mutex> lock(mutex);
+        result.meshes[i] = std::move(plyMesh);
+        if (displaced)
+            result.displacedIndices.push_back(int(i));
+    });
+
+    return result;
+}
+
+void OptiXAggregate::ApplyPLYDisplacements(
+    const std::vector<ShapeSceneEntity> &shapes,
+    const std::vector<int> &displacedIndices,
+    const std::map<std::string, FloatTexture> &floatTextures,
+    std::map<int, TriQuadMesh> *meshes) {
+    for (int shapeIndex : displacedIndices) {
+        const auto &shape = shapes[shapeIndex];
+        auto iter = meshes->find(shapeIndex);
+        CHECK(iter != meshes->end());
+        DisplaceOnePlyMesh(shape, &iter->second, floatTextures);
+    }
 }
 
 OptiXAggregate::BVH OptiXAggregate::buildBVHForTriangles(
@@ -1324,7 +1378,8 @@ OptiXAggregate::OptiXAggregate(
     const std::map<int, pstd::vector<Light> *> &shapeIndexToAreaLights,
     const std::map<std::string, Medium> &media,
     const std::map<std::string, pbrt::Material> &namedMaterials,
-    const std::vector<pbrt::Material> &materials)
+    const std::vector<pbrt::Material> &materials,
+    std::map<int, TriQuadMesh> preloadedPlyMeshes)
     : memoryResource(memoryResource), cudaStream(nullptr) {
     auto initStart = std::chrono::high_resolution_clock::now();
     CUcontext cudaContext;
@@ -1529,8 +1584,13 @@ OptiXAggregate::OptiXAggregate(
     Printf("STAGE_TIMING [optix-init] %.2f s\n",
            std::chrono::duration<double>(initEnd - initStart).count());
     auto plyStart = std::chrono::high_resolution_clock::now();
-    std::map<int, TriQuadMesh> plyMeshes =
-        PreparePLYMeshes(scene.shapes, textures.floatTextures);
+    std::map<int, TriQuadMesh> plyMeshes;
+    if (!preloadedPlyMeshes.empty()) {
+        // Loaded (and displacement-applied) ahead of time on a background
+        // thread while textures were being created.
+        plyMeshes = std::move(preloadedPlyMeshes);
+    } else
+        plyMeshes = PreparePLYMeshes(scene.shapes, textures.floatTextures);
     auto plyEnd = std::chrono::high_resolution_clock::now();
     Printf("STAGE_TIMING [optix-prepare-ply] %.2f s\n",
            std::chrono::duration<double>(plyEnd - plyStart).count());

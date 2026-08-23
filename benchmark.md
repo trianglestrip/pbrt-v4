@@ -1,4 +1,4 @@
-# pbrt-v4 GPU build — Benchmark & Build Notes
+﻿# pbrt-v4 GPU build — Benchmark & Build Notes
 
 Machine: RTX 2060 SUPER (sm_75, Turing), driver 591.86 · CUDA 13.1 ·
 OptiX SDK 8.0.0 · VS 2022 Community · CMake 3.31.6 · Windows 10/11.
@@ -327,6 +327,35 @@ texture-upload       : 12.4 / 12.5 / 27.0* / 12.4 s
 \* run 3 caught a transient load spike. Stable median **~26 s**, consistent
 with the best-of runs above and confirming no regression from the
 static-deflate submodule patches.
+
+
+## Task-graph overlap: background PLY preload
+
+PLY loading (optix-prepare-ply) is pure CPU work with no dependency on
+textures/lights/materials, yet it used to sit on the critical path between
+texture creation and the BVH builds -- and it swings wildly under machine
+load (0.9 s idle vs 13 s observed). It now runs on a background thread
+started immediately after parsing, concurrently with `wpi-CreateTextures`:
+
+```
+main : parse -> CreateTextures -> Lights/Materials -> join -> [displace] -> OptiXAggregate
+bg   :            PreparePLYMeshesLoadOnly(850 meshes)
+bg   :            FlushGPUTextureUploads (unchanged, overlaps OptiXAggregate)
+```
+
+Implementation: `OptiXAggregate::PreparePLYMeshesLoadOnly` (real parallelism
+via `ParallelForManual`, since `PreparePLYMeshes` runs serially under
+`DisableThreadPool`) plus `ApplyPLYDisplacements` for the deferred
+displacement-texture evaluation that needs `floatTextures`. `OptiXAggregate`
+gains a trailing `preloadedPlyMeshes` constructor parameter; empty means
+load-as-before.
+
+Result (`bistro_cafe_quick`, 850 PLY meshes): ctor-side `optix-prepare-ply`
+drops to 0.00 s; `gpu-build+upload+bvh` = 28.6 / 26.5 / 31.9 s vs the ~26 s
+baseline. On an idle machine the saving is small (idle prepare-ply is only
+~0.9 s), but PLY I/O spikes no longer reach the critical path at all -- the
+13 s spike observed earlier today would have been fully hidden. Output is
+pixel-identical (`imgtool diff` MAE == 0).
 
 ## How to render
 

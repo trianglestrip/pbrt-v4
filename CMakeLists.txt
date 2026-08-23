@@ -1015,6 +1015,33 @@ target_compile_options (pbrt_parseprobe PRIVATE ${PBRT_CXX_FLAGS})
 target_include_directories (pbrt_parseprobe PRIVATE src src/ext)
 target_link_libraries (pbrt_parseprobe PRIVATE ${ALL_PBRT_LIBS} pbrt_opt pbrt_warnings)
 
+######################
+## pbrt_editor_probe (Track A: scene graph -> ParserTarget events)
+
+add_executable (pbrt_editor_probe
+  src/pbrt/cmd/editor_probe.cpp
+  src/pbrt/editor/scene_graph.cpp
+  src/pbrt/editor/parser_target_adapter.cpp)
+add_executable (pbrt::pbrt_editor_probe ALIAS pbrt_editor_probe)
+
+target_compile_definitions (pbrt_editor_probe PRIVATE ${PBRT_DEFINITIONS})
+target_compile_options (pbrt_editor_probe PRIVATE ${PBRT_CXX_FLAGS})
+target_include_directories (pbrt_editor_probe PRIVATE src src/ext)
+target_link_libraries (pbrt_editor_probe PRIVATE ${ALL_PBRT_LIBS} pbrt_opt pbrt_warnings)
+
+######################
+## pbrt_renderstream_probe (Track B: RenderSink consuming ParserTarget events)
+
+add_executable (pbrt_renderstream
+  src/pbrt/cmd/renderstream_probe.cpp
+  src/pbrt/wavefront/render_sink.cpp)
+add_executable (pbrt::pbrt_renderstream ALIAS pbrt_renderstream)
+
+target_compile_definitions (pbrt_renderstream PRIVATE ${PBRT_DEFINITIONS})
+target_compile_options (pbrt_renderstream PRIVATE ${PBRT_CXX_FLAGS})
+target_include_directories (pbrt_renderstream PRIVATE src src/ext)
+target_link_libraries (pbrt_renderstream PRIVATE ${ALL_PBRT_LIBS} pbrt_opt pbrt_warnings)
+
 set_property (TARGET pbrt_exe PROPERTY FOLDER "cmd")
 
 ######################

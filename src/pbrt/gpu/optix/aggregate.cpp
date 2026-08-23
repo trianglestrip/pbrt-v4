@@ -473,13 +473,31 @@ OptiXAggregate::BVH OptiXAggregate::buildBVHForTriangles(
 
     auto bvhStart = std::chrono::high_resolution_clock::now();
 
+    ResetManagedAllocStats();
+    std::atomic<uint64_t> meshCtorNs{0}, boundsNs{0};
+
+    // Mesh construction uses HOST memory: cudaMallocManaged is
+    // driver-serialized (and implicitly syncs with any in-flight GPU work,
+    // e.g. the background texture uploads), which stalls the whole parallel
+    // build.  The geometry is copied to pure device buffers below, and the
+    // SBT records point at small device-resident TriangleMesh mirrors whose
+    // array members target those buffers -- so nothing on the GPU ever reads
+    // the host copies.
+    ThreadLocal<Allocator> threadHostAllocators([]() {
+        pstd::pmr::monotonic_buffer_resource *resource =
+            new pstd::pmr::monotonic_buffer_resource(16 * 1024 * 1024,
+                                                     pstd::pmr::new_delete_resource());
+        return Allocator(resource);
+    });
+
     std::vector<TriangleMesh *> meshes(nMeshes, nullptr);
     std::vector<Bounds3f> meshBounds(nMeshes);
     ParallelForManual(nMeshes, [&](int64_t meshIndex) {
-        Allocator alloc = threadAllocators.Get();
+        Allocator alloc = threadHostAllocators.Get();
         size_t shapeIndex = meshIndexToShapeIndex[meshIndex];
         const auto &shape = shapes[shapeIndex];
 
+        auto mc0 = std::chrono::steady_clock::now();
         TriangleMesh *mesh = nullptr;
         if (shape.name == "trianglemesh") {
             mesh = Triangle::CreateMesh(shape.renderFromObject, shape.reverseOrientation,
@@ -536,9 +554,18 @@ OptiXAggregate::BVH OptiXAggregate::buildBVHForTriangles(
         } else
             LOG_FATAL("Logic error in GPUAggregate::buildBVHForTriangles()");
 
+        auto mc1 = std::chrono::steady_clock::now();
+        meshCtorNs.fetch_add(
+            uint64_t(std::chrono::duration<double, std::nano>(mc1 - mc0).count()));
+
         Bounds3f bounds;
         for (size_t i = 0; i < mesh->nVertices; ++i)
             bounds = Union(bounds, mesh->p[i]);
+
+        boundsNs.fetch_add(uint64_t(
+            std::chrono::duration<double, std::nano>(
+                std::chrono::steady_clock::now() - mc1)
+                .count()));
 
         meshes[meshIndex] = mesh;
         meshBounds[meshIndex] = bounds;
@@ -546,6 +573,10 @@ OptiXAggregate::BVH OptiXAggregate::buildBVHForTriangles(
     Printf("STAGE_TIMING [optix-tri-meshCreate] %.2f s\n",
            std::chrono::duration<double>(std::chrono::high_resolution_clock::now() -
                                           bvhStart).count());
+    Printf("STAGE_TIMING [optix-tri-meshCreate-detail] ctor %.2f s / bounds %.2f s / "
+           "managed-allocs %llu calls in %.2f s\n",
+           meshCtorNs.load() / 1e9, boundsNs.load() / 1e9,
+           (unsigned long long)ManagedAllocCalls(), ManagedAllocSeconds());
 
     BVH bvh(nMeshes);
     std::vector<OptixBuildInput> optixBuildInputs(nMeshes);
@@ -558,6 +589,10 @@ OptiXAggregate::BVH OptiXAggregate::buildBVHForTriangles(
     std::vector<int> meshVertCount(nMeshes, 0);
     std::vector<const int *> meshIdxPtr(nMeshes, nullptr);
     std::vector<int> meshIdxCount(nMeshes, 0);
+    std::vector<const Normal3f *> meshNPtr(nMeshes, nullptr);
+    std::vector<const Vector3f *> meshSPtr(nMeshes, nullptr);
+    std::vector<const Point2f *> meshUvPtr(nMeshes, nullptr);
+    std::vector<const int *> meshFacePtr(nMeshes, nullptr);
 
     // P4: the SBT record header depends only on the program group, so the
     // three headers are identical for every mesh. Capture them once here and
@@ -598,6 +633,10 @@ OptiXAggregate::BVH OptiXAggregate::buildBVHForTriangles(
             meshVertCount[meshIndex] = mesh->nVertices;
             meshIdxPtr[meshIndex] = mesh->vertexIndices;
             meshIdxCount[meshIndex] = mesh->nTriangles;
+            meshNPtr[meshIndex] = mesh->n;
+            meshSPtr[meshIndex] = mesh->s;
+            meshUvPtr[meshIndex] = mesh->uv;
+            meshFacePtr[meshIndex] = mesh->faceIndices;
 
             pDeviceDevicePtrs[meshIndex] = CUdeviceptr(nullptr);
             input.triangleArray.vertexBuffers = &pDeviceDevicePtrs[meshIndex];
@@ -697,22 +736,118 @@ OptiXAggregate::BVH OptiXAggregate::buildBVHForTriangles(
         }
     }
 
+    // Concatenate per-mesh shading arrays (normals / tangents / uv / face
+    // indices) for bulk upload alongside p/index data.
+    std::vector<Normal3f> allN;
+    std::vector<Vector3f> allS;
+    std::vector<Point2f> allUv;
+    std::vector<int> allFace;
+    for (size_t i = 0; i < nMeshes; ++i) {
+        if (meshNPtr[i])
+            allN.insert(allN.end(), meshNPtr[i], meshNPtr[i] + meshVertCount[i]);
+        if (meshSPtr[i])
+            allS.insert(allS.end(), meshSPtr[i], meshSPtr[i] + meshVertCount[i]);
+        if (meshUvPtr[i])
+            allUv.insert(allUv.end(), meshUvPtr[i], meshUvPtr[i] + meshVertCount[i]);
+        if (meshFacePtr[i])
+            allFace.insert(allFace.end(), meshFacePtr[i],
+                           meshFacePtr[i] + meshIdxCount[i]);
+    }
+    // Per-mesh offsets into the device arrays.
+    std::vector<size_t> nOff(nMeshes), sOff(nMeshes), uvOff(nMeshes), faceOff(nMeshes);
+    {
+        size_t o = 0;
+        for (size_t i = 0; i < nMeshes; ++i) {
+            nOff[i] = o;
+            if (meshNPtr[i]) o += meshVertCount[i];
+        }
+        o = 0;
+        for (size_t i = 0; i < nMeshes; ++i) {
+            sOff[i] = o;
+            if (meshSPtr[i]) o += meshVertCount[i];
+        }
+        o = 0;
+        for (size_t i = 0; i < nMeshes; ++i) {
+            uvOff[i] = o;
+            if (meshUvPtr[i]) o += meshVertCount[i];
+        }
+        o = 0;
+        for (size_t i = 0; i < nMeshes; ++i) {
+            faceOff[i] = o;
+            if (meshFacePtr[i]) o += meshIdxCount[i];
+        }
+    }
+
     auto upStart = std::chrono::high_resolution_clock::now();
     Printf("STAGE_TIMING [optix-tri-flatten] %.2f s\n",
            std::chrono::duration<double>(std::chrono::high_resolution_clock::now() -
                                           bvhStart).count());
+
+    // Dedicated copy stream: default-stream H2D copies implicitly synchronize
+    // with every other blocking stream, so they otherwise serialize behind the
+    // background texture uploads (adding their full duration to the ctor).
+    // A private stream lets the geometry copies overlap that DMA work; we
+    // synchronize once below, before the acceleration build consumes them.
+    static cudaStream_t geomCopyStream = nullptr;
+    if (!geomCopyStream)
+        CUDA_CHECK(cudaStreamCreate(&geomCopyStream));
+    auto uploadToDevice = [&](const void *host, size_t bytes) -> void * {
+        void *dev = nullptr;
+        if (bytes > 0) {
+            CUDA_CHECK(cudaMalloc(&dev, bytes));
+            CUDA_CHECK(
+                cudaMemcpyAsync(dev, host, bytes, cudaMemcpyHostToDevice,
+                                geomCopyStream));
+        }
+        return dev;
+    };
+
     float *vertDev = nullptr;
     int *idxDev = nullptr;
-    if (totalVertBytes > 0) {
-        CUDA_CHECK(cudaMalloc(&vertDev, totalVertBytes));
-        CUDA_CHECK(cudaMemcpy(vertDev, allVerts.data(), totalVertBytes,
-                              cudaMemcpyHostToDevice));
+    if (totalVertBytes > 0)
+        vertDev = (float *)uploadToDevice(allVerts.data(), totalVertBytes);
+    if (totalIdxBytes > 0)
+        idxDev = (int *)uploadToDevice(allIdx.data(), totalIdxBytes);
+
+    Normal3f *nDev = (Normal3f *)uploadToDevice(allN.data(), allN.size() * sizeof(Normal3f));
+    Vector3f *sDev = (Vector3f *)uploadToDevice(allS.data(), allS.size() * sizeof(Vector3f));
+    Point2f *uvDev = (Point2f *)uploadToDevice(allUv.data(), allUv.size() * sizeof(Point2f));
+    int *faceDev = (int *)uploadToDevice(allFace.data(), allFace.size() * sizeof(int));
+
+    TriangleMesh *meshMirrorsDev = nullptr;
+    {
+        std::vector<char> hMirrors(sizeof(TriangleMesh) * nMeshes);
+        TriangleMesh *hM = reinterpret_cast<TriangleMesh *>(hMirrors.data());
+        for (size_t i = 0; i < nMeshes; ++i) {
+            const TriangleMesh *m = meshes[i];
+            TriangleMesh *mm = hM + i;
+            memcpy(mm, m, sizeof(TriangleMesh));  // POD: no vtable, no handles
+            mm->p = (const Point3f *)((char *)vertDev + vertOffsetBytes[i]);
+            mm->vertexIndices = (const int *)((char *)idxDev + idxOffsetBytes[i]);
+            mm->n = meshNPtr[i] ? (const Normal3f *)((char *)nDev + nOff[i] * sizeof(Normal3f))
+                                : nullptr;
+            mm->s = meshSPtr[i] ? (const Vector3f *)((char *)sDev + sOff[i] * sizeof(Vector3f))
+                                : nullptr;
+            mm->uv = meshUvPtr[i] ? (const Point2f *)((char *)uvDev + uvOff[i] * sizeof(Point2f))
+                                  : nullptr;
+            mm->faceIndices =
+                meshFacePtr[i] ? (const int *)((char *)faceDev + faceOff[i] * sizeof(int))
+                               : nullptr;
+        }
+        meshMirrorsDev =
+            (TriangleMesh *)uploadToDevice(hM, hMirrors.size());
     }
-    if (totalIdxBytes > 0) {
-        CUDA_CHECK(cudaMalloc(&idxDev, totalIdxBytes));
-        CUDA_CHECK(cudaMemcpy(idxDev, allIdx.data(), totalIdxBytes,
-                              cudaMemcpyHostToDevice));
+
+    // Repoint the SBT records at the device mirrors.
+    for (size_t i = 0; i < nMeshes; ++i) {
+        const TriangleMesh *dm =
+            (const TriangleMesh *)((char *)meshMirrorsDev + i * sizeof(TriangleMesh));
+        bvh.intersectHGRecords[i].triRec.mesh = dm;
+        bvh.randomHitHGRecords[i].triRec.mesh = dm;
+        bvh.shadowHGRecords[i].triRec.mesh = dm;
     }
+
+    CUDA_CHECK(cudaStreamSynchronize(geomCopyStream));
     auto upEnd = std::chrono::high_resolution_clock::now();
     g_optixUploadUs.fetch_add(
         std::chrono::duration_cast<std::chrono::microseconds>(upEnd - upStart).count(),
@@ -1606,7 +1741,13 @@ OptiXAggregate::OptiXAggregate(
     // so would cause the memory they manage to be freed.
     ThreadLocal<Allocator> threadAllocators([memoryResource]() {
         pstd::pmr::monotonic_buffer_resource *resource =
-            new pstd::pmr::monotonic_buffer_resource(1024 * 1024, memoryResource);
+            // 64 MB bump blocks: cudaMallocManaged is driver-serialized and
+        // costs tens of ms per call under memory pressure, so every upstream
+        // allocation stall the whole parallel mesh-build.  Larger blocks cut
+        // the number of managed allocations by orders of magnitude (267 ->
+        // ~dozens on bistro).  Worst-case slack is one partial block per
+        // thread.
+        new pstd::pmr::monotonic_buffer_resource(64 * 1024 * 1024, memoryResource);
         return Allocator(resource);
     });
 

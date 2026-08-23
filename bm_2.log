@@ -1,0 +1,36 @@
+pbrt version 4 (built Aug 23 2026 at 18:00:35)
+Copyright (c)1998-2021 Matt Pharr, Wenzel Jakob, and Greg Humphreys.
+The source code to pbrt (but *not* the book contents) is covered by the Apache 2.0 License.
+See the file LICENSE.txt for the conditions of the license.
+STAGE_TIMING [parse] 1.62 s
+STAGE_TIMING [wpi-CreateMedia] 0.00 s
+STAGE_TIMING [ply-preload] started in background
+STAGE_TIMING [wpi-CreateTextures] 8.85 s
+STAGE_TIMING [wpi-CreateLights] 2.84 s
+STAGE_TIMING [wpi-CreateMaterials] 0.00 s
+STAGE_TIMING [wpi-pre-flush] 12.26 s
+STAGE_TIMING [ply-preload] ready (850 meshes)
+STAGE_TIMING [optix-init] 0.01 s
+STAGE_TIMING [optix-prepare-ply] 0.00 s
+STAGE_TIMING [optix-top-gas-builds] 0.00 s
+STAGE_TIMING [optix-ias-instance-defs] 0.00 s
+STAGE_TIMING [optix-tri-meshCreate] 0.13 s
+STAGE_TIMING [optix-tri-meshCreate-detail] ctor 0.74 s / bounds 0.05 s / managed-allocs 0 calls in 0.00 s
+STAGE_TIMING [optix-tri-buildInputs] 0.13 s
+STAGE_TIMING [optix-tri-flatten] 0.46 s
+STAGE_TIMING [optix-bvh-triangles-fn] 0.73 s (nMeshes=1591)
+STAGE_TIMING [optix-bvh-triangles-upload] 0.17 s
+STAGE_TIMING [optix-top-build-tri] 0.81 s
+STAGE_TIMING [optix-top-build-blp] 0.00 s
+STAGE_TIMING [optix-top-build-quad] 0.00 s
+STAGE_TIMING [optix-instances] 0.81 s
+STAGE_TIMING [optix-accelbuild-total] 0.11 s
+STAGE_TIMING [optix-ctor-total] 0.83 s
+STAGE_TIMING [wpi-lightPreprocess] 0.02 s
+STAGE_TIMING [wpi-lightSampler] 2.32 s
+STAGE_TIMING [wpi-queueAlloc] 1.86 s
+STAGE_TIMING [wpi-post-flush] 5.22 s
+STAGE_TIMING [texture-upload] 11.18 s (147 unique textures)
+STAGE_TIMING [gpu-build+upload+bvh] 33.05 s
+Rendering: [  ] Rendering: [  ]  (0.1s|?s)  Rendering: [  ]  (0.1s|?s)  Rendering: [  ]  (0.2s|?s)  Rendering: [  ]  (0.2s|?s)  Rendering: [  ]  (0.3s|?s)  Rendering: [  ]  (0.3s|?s)  Rendering: [+ ]  (0.4s|1.2s)  Rendering: [+ ]  (0.5s|0.3s)  Rendering: [++]  (0.5s)       Rendering: [++]  (0.5s)       
+STAGE_TIMING [render-total] 33.80 s

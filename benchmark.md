@@ -420,6 +420,34 @@ Compared to the 8 spp quick baseline (~24-32 s wall), 64 spp adds roughly
 17 s of pure sampling (8x the rays), i.e. startup remains ~25-28 s and the
 rest is sample time scaling linearly with spp as expected.
 
+
+## Host-side mesh build + device mirrors (kills the cudaMallocManaged stall)
+
+Profiling optix-tri-meshCreate (~13 s, was thought to be ~2 s) showed:
+~1600 TriangleMesh constructions are parallel (ParallelForManual) but every
+array allocation goes through cudaMallocManaged -- driver-serialized AND
+implicitly syncing with in-flight GPU work (the background texture
+uploads), ~65 ms per call under memory pressure. Chunk-size tuning does
+not help: cost scales with bytes, not calls.
+
+Fix: mesh construction now uses plain HOST memory (monotonic buffers over
+new_delete), all per-mesh arrays (p/indices/n/s/uv/faceIndices) are bulk-
+uploaded to pure device buffers on a dedicated copy stream
+(`geomCopyStream`, cudaMemcpyAsync so they overlap texture-upload DMA), and
+each SBT record points at a tiny device-resident TriangleMesh *mirror*
+(POD memcpy + pointer patch) whose members target those device buffers.
+The closest-hit shaders need no changes: they keep dereferencing rec.mesh,
+which is now device-resident.
+
+Result: optix-tri-meshCreate 13.0 -> 0.13 s (managed allocs 0),
+optix-ctor-total ~13 -> 0.8-9 s (remaining time is real PCIe data
+movement, varying with DMA contention). Output pixel-identical vs the 8 spp
+reference (imgtool MAE == 0), 4/4 clean runs.
+
+Next candidate if more is needed: move the whole geometry-prep+upload onto
+the background thread (it no longer needs textures/lights/materials at all);
+only SBT-record assembly must stay in the ctor after materials.
+
 ## How to render
 
 ```bat

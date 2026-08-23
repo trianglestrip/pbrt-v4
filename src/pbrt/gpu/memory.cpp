@@ -11,9 +11,47 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 
+#include <atomic>
+#include <chrono>
+
 namespace pbrt {
 
+// Managed-allocation profiling (see memory.h).  Counters are cumulative;
+// callers read-and-reset them around the stage of interest.
+static std::atomic<uint64_t> managedAllocCalls{0};
+static std::atomic<uint64_t> managedAllocNs{0};
+
+void ResetManagedAllocStats() {
+    managedAllocCalls.store(0, std::memory_order_relaxed);
+    managedAllocNs.store(0, std::memory_order_relaxed);
+}
+
+uint64_t ManagedAllocCalls() {
+    return managedAllocCalls.load(std::memory_order_relaxed);
+}
+
+double ManagedAllocSeconds() {
+    return managedAllocNs.load(std::memory_order_relaxed) / 1e9;
+}
+
+namespace {
+struct ScopedManagedAllocTimer {
+    std::chrono::steady_clock::time_point start{
+        std::chrono::steady_clock::now()};
+    ~ScopedManagedAllocTimer() {
+        managedAllocNs.fetch_add(
+            uint64_t(std::chrono::duration<double, std::nano>(
+                         std::chrono::steady_clock::now() - start)
+                         .count()),
+            std::memory_order_relaxed);
+    }
+};
+}  // namespace
+
 void *CUDAMemoryResource::do_allocate(size_t size, size_t alignment) {
+    ScopedManagedAllocTimer timer;
+    managedAllocCalls.fetch_add(1, std::memory_order_relaxed);
+
     void *ptr;
     CUDA_CHECK(cudaMallocManaged(&ptr, size));
     CHECK_EQ(0, intptr_t(ptr) % alignment);
@@ -27,6 +65,9 @@ void CUDAMemoryResource::do_deallocate(void *p, size_t bytes, size_t alignment) 
 void *CUDATrackedMemoryResource::do_allocate(size_t size, size_t alignment) {
     if (size == 0)
         return nullptr;
+
+    ScopedManagedAllocTimer timer;
+    managedAllocCalls.fetch_add(1, std::memory_order_relaxed);
 
     void *ptr;
     CUDA_CHECK(cudaMallocManaged(&ptr, size));

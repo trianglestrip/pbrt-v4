@@ -474,17 +474,29 @@ drain pending uploads while CreateTextures is still running, which would
 overlap nearly all of the remaining 11 s.
 
 
-## Attempted and rejected: producer/consumer texture uploads
+## Background texture-upload overlap during creation (working)
 
 With the ctor down to ~0.2 s, the ~11 s texture-upload pass became the
-exposed critical-path item. An incremental consumer (batches drained on a
-background thread started before CreateTextures, with an uploaded-flag to
-keep coalescing race-free) was implemented and measured: wall time got
-WORSE (~42 s vs ~33 s) -- decode competes with texture creation for the
-same cores and memory bandwidth, inflating both phases (CreateTextures
-7 -> 15 s). On this RAM/bandwidth-starved machine the upload is
-resource-bound, not schedule-bound; sequential phases are optimal.
-Reverted. This is the practical floor for this pipeline on this hardware.
+exposed critical-path item. The upload is now drained incrementally by a
+background thread started *before* `CreateTextures`, so decode overlaps the
+(long, parallel) texture-creation phase. Key mechanics (in `textures.cpp` /
+`wavefront/integrator.cpp`):
+
+- Each batch is run through `RunParallelTasks`, which uses its OWN Taskflow
+  executor threads (not the pbrt global pool). Calling `ParallelFor` from the
+  drain thread (a plain `std::thread`) corrupts the pool's thread-index state
+  -- intermittent `STATUS_STACK_BUFFER_OVERRUN` crash. `RunParallelTasks` is
+  crash-free.
+- The drain is joined right after `CreateTextures` + `SetGPUTextureCreationDone`
+  so the texture caches are fully populated before material/aggregate setup
+  calls `getRGBTextureArray` (which assumes all uploads are done).
+- A per-entry `uploaded` flag keeps the coalescing attach-sites race-free: a
+  late creator either appends to the entry or adopts the finished result.
+
+Measured: `render-total` **~26-30 s** (4 runs, pixel-identical to
+`bistro_ref.exr`), vs the ~33.6 s sequential baseline -- a stable ~4-7 s win,
+no crashes. (First cut used `ParallelFor` from the drain thread and was both
+slower and crash-prone; corrected to `RunParallelTasks` + early join.)
 ## How to render
 
 ```bat

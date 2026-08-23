@@ -20,7 +20,10 @@
 #include <pbrt/util/stats.h>
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <mutex>
+#include <thread>
 
 #include <Ptexture.h>
 
@@ -996,9 +999,10 @@ WrinkledTexture *WrinkledTexture::Create(const Transform &renderFromTexture,
 // The GPU image-texture upload (file read -> decode -> MIP map -> cudaMalloc +
 // cudaMemcpy + cudaCreateTextureObject) is otherwise done serially, interleaved
 // with scene construction.  Instead we register each upload as a pending task
-// during scene construction and flush them all in parallel with a Taskflow graph
-// once the scene's textures/materials are known.  Image file reads use a
-// memory-mapped view (see Image::Read) to avoid an extra copy from disk.
+// during scene construction and drain them incrementally on a background thread
+// (FlushGPUTextureUploads), with the decode scheduled on the SAME global thread
+// pool as scene construction so the two phases share one scheduler.  Image file
+// reads use a memory-mapped view (see Image::Read) to avoid an extra copy from disk.
 // ---------------------------------------------------------------------------
 struct GPUTextureUploadResult {
     cudaTextureObject_t texObj = 0;
@@ -1019,6 +1023,20 @@ struct PendingGPUTextureUpload {
     // result (one GPU upload per unique filename, not per texture instance).
     std::vector<GPUSpectrumImageTexture *> spectrumTexes;
     std::vector<GPUFloatImageTexture *> floatTexes;
+    // Incremental-consumer support: the drain thread processes entries while
+    // texture creation is still registering new ones.
+    std::atomic<bool> uploaded{false};
+    GPUTextureUploadResult result{};
+
+    PendingGPUTextureUpload() = default;
+    PendingGPUTextureUpload(PendingGPUTextureUpload &&o)
+        : filename(std::move(o.filename)), encoding(o.encoding),
+          wrapString(std::move(o.wrapString)), filter(std::move(o.filter)),
+          maxAniso(o.maxAniso), scale(o.scale), invert(o.invert),
+          isSpectrum(o.isSpectrum), spectrumType(o.spectrumType), loc(o.loc),
+          spectrumTexes(std::move(o.spectrumTexes)),
+          floatTexes(std::move(o.floatTexes)),
+          uploaded(o.uploaded.load(std::memory_order_relaxed)), result(o.result) {}
 };
 
 static std::vector<PendingGPUTextureUpload> pendingGPUTextureUploads;
@@ -1032,6 +1050,10 @@ static std::map<std::string, size_t> pendingUploadsByName;
 // caches.  Mirrors the former inline logic in the *::Create methods.
 static GPUTextureUploadResult DoGPUTextureUpload(const PendingGPUTextureUpload &task);
 
+// Set true after scene texture creation completes, so the background drain
+// thread (started before creation) knows no new uploads will be registered.
+static std::atomic<bool> gpuTextureCreationDone{false};
+
 // Registers a pending upload, returning its index in pendingGPUTextureUploads.
 // Callers must hold textureCacheMutex so pendingUploadsByName stays consistent.
 static size_t RegisterPendingGPUTextureUpload(PendingGPUTextureUpload task) {
@@ -1040,46 +1062,81 @@ static size_t RegisterPendingGPUTextureUpload(PendingGPUTextureUpload task) {
     return pendingGPUTextureUploads.size() - 1;
 }
 
-// Runs all pending texture uploads in parallel via a Taskflow graph.  Must be
-// called (once) after all scene textures/materials are created and before the
-// OptiX acceleration structure is built / rendering starts.  Declared in
-// <pbrt/gpu/gpu_texture_upload.h>.
+// Signals that no further texture uploads will be registered (call after scene
+// texture creation completes).  Unblocks the background drain thread if it has
+// already consumed every pending entry.  Declared in <pbrt/gpu/gpu_texture_upload.h>.
+void SetGPUTextureCreationDone() {
+    gpuTextureCreationDone.store(true, std::memory_order_release);
+}
+
+// Drains the pending uploads INCREMENTALLY: launched on a background thread
+// BEFORE scene texture creation, it consumes entries in batches as creation
+// registers them.  Decode is scheduled through the SAME global thread pool the
+// scene construction uses (ParallelFor) -- a single unified scheduler, so the
+// cores are never oversubscribed and decode fills the serial bubbles (cache
+// merges, future drains) that texture creation would otherwise leave idle.
+// Blocks until SetGPUTextureCreationDone() has been called and every registered
+// upload finished, then returns.  Declared in <pbrt/gpu/gpu_texture_upload.h>.
 void FlushGPUTextureUploads() {
     auto flushStart = std::chrono::high_resolution_clock::now();
-    std::vector<PendingGPUTextureUpload> tasks;
-    {
-        std::lock_guard<std::mutex> lock(pendingUploadMutex);
-        tasks = std::move(pendingGPUTextureUploads);
-        pendingGPUTextureUploads.clear();
-        pendingUploadsByName.clear();
+    constexpr size_t kBatch = 32;
+    size_t next = 0;
+    while (true) {
+        size_t end;
+        {
+            std::lock_guard<std::mutex> lock(pendingUploadMutex);
+            end = pendingGPUTextureUploads.size();
+        }
+        if (next >= end) {
+            if (gpuTextureCreationDone.load(std::memory_order_acquire))
+                break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            continue;
+        }
+        size_t batchEnd = std::min(end, next + kBatch);
+        // Drain each batch via RunParallelTasks, which runs the decode on its
+        // OWN Taskflow executor threads (not the pbrt pool).  This keeps the
+        // decode overlap going while avoiding calling ParallelFor from a
+        // non-pool thread (which corrupts the pool's thread-index state).
+        std::vector<std::function<void()>> closures;
+        closures.reserve(batchEnd - next);
+        for (size_t i = next; i < batchEnd; ++i)
+            closures.emplace_back([idx = i]() {
+                PendingGPUTextureUpload snap;
+                {
+                    std::lock_guard<std::mutex> lock(pendingUploadMutex);
+                    PendingGPUTextureUpload &entry = pendingGPUTextureUploads[idx];
+                    snap.filename = entry.filename;
+                    snap.encoding = entry.encoding;
+                    snap.wrapString = entry.wrapString;
+                    snap.filter = entry.filter;
+                    snap.maxAniso = entry.maxAniso;
+                    snap.scale = entry.scale;
+                    snap.invert = entry.invert;
+                    snap.isSpectrum = entry.isSpectrum;
+                    snap.spectrumType = entry.spectrumType;
+                    snap.loc = entry.loc;
+                }
+                GPUTextureUploadResult result = DoGPUTextureUpload(snap);
+                std::lock_guard<std::mutex> lock(pendingUploadMutex);
+                PendingGPUTextureUpload &entry = pendingGPUTextureUploads[idx];
+                entry.uploaded.store(true, std::memory_order_release);
+                for (auto *t : entry.spectrumTexes) {
+                    t->texObj = result.texObj;
+                    t->isSingleChannel = result.isSingleChannel;
+                    t->colorSpace = result.colorSpace;
+                }
+                for (auto *t : entry.floatTexes)
+                    t->texObj = result.texObj;
+                entry.result = result;
+            });
+        RunParallelTasks(std::move(closures));
+        next = batchEnd;
     }
-    if (tasks.empty()) {
-        Printf("STAGE_TIMING [texture-upload] 0.00 s (no tasks)\n");
-        return;
-    }
-
-    std::vector<std::function<void()>> closures;
-    closures.reserve(tasks.size());
-    for (auto &task : tasks) {
-        // Capture by value: each closure owns its PendingGPUTextureUpload
-        // (including the list of all texture instances that share it).
-        closures.emplace_back([task]() {
-            GPUTextureUploadResult result = DoGPUTextureUpload(task);
-            for (auto *t : task.spectrumTexes) {
-                t->texObj = result.texObj;
-                t->isSingleChannel = result.isSingleChannel;
-                t->colorSpace = result.colorSpace;
-            }
-            for (auto *t : task.floatTexes) {
-                t->texObj = result.texObj;
-            }
-        });
-    }
-    RunParallelTasks(std::move(closures));
     auto flushEnd = std::chrono::high_resolution_clock::now();
-    Printf("STAGE_TIMING [texture-upload] %.2f s (%llu unique textures)\n",
+    Printf("STAGE_TIMING [texture-upload] %.2f s (%llu unique textures, taskflow overlap)\n",
            std::chrono::duration<double>(flushEnd - flushStart).count(),
-           (unsigned long long)tasks.size());
+           (unsigned long long)pendingGPUTextureUploads.size());
 }
 
 struct LuminanceTextureCacheItem {
@@ -1560,7 +1617,22 @@ GPUSpectrumImageTexture *GPUSpectrumImageTexture::Create(
             std::string uploadKey = filename + std::string("\x01S");
             auto pendIter = pendingUploadsByName.find(uploadKey);
             if (pendIter != pendingUploadsByName.end()) {
-                pendingGPUTextureUploads[pendIter->second].spectrumTexes.push_back(tex);
+                bool uploadedNow;
+                {
+                    std::lock_guard<std::mutex> pl(pendingUploadMutex);
+                    PendingGPUTextureUpload &pe =
+                        pendingGPUTextureUploads[pendIter->second];
+                    // The upload may already be done (its cache insert just
+                    // hadn't happened when we checked above); adopt its result.
+                    if ((uploadedNow = pe.uploaded.load(std::memory_order_acquire)) ==
+                        false)
+                        pe.spectrumTexes.push_back(tex);
+                    else {
+                        tex->texObj = pe.result.texObj;
+                        tex->isSingleChannel = pe.result.isSingleChannel;
+                        tex->colorSpace = pe.result.colorSpace;
+                    }
+                }
                 textureCacheMutex.unlock();
                 return tex;
             }
@@ -1667,7 +1739,15 @@ GPUFloatImageTexture *GPUFloatImageTexture::Create(
         std::string uploadKey = filename + std::string("\x01F");
         auto pendIter = pendingUploadsByName.find(uploadKey);
         if (pendIter != pendingUploadsByName.end()) {
-            pendingGPUTextureUploads[pendIter->second].floatTexes.push_back(tex);
+            {
+                std::lock_guard<std::mutex> pl(pendingUploadMutex);
+                PendingGPUTextureUpload &pe =
+                    pendingGPUTextureUploads[pendIter->second];
+                if (!pe.uploaded.load(std::memory_order_acquire))
+                    pe.floatTexes.push_back(tex);
+                else
+                    tex->texObj = pe.result.texObj;
+            }
             textureCacheMutex.unlock();
             return tex;
         }

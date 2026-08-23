@@ -54,11 +54,49 @@ Binary: `build\Release\pbrt.exe`
 
 - The GPU ray tracing itself is fast (a 640×360 @ 8spp bistro crop finishes
   its tiles in well under 1s). Wall-clock time is dominated by:
-  1. **~110s fixed startup** — OptiX acceleration-structure (BVH) build plus
-     texture upload for heavy scenes like `bistro`. This is roughly constant
-     regardless of sample count.
+  1. **Startup** — OptiX BVH build + texture upload. After the P0–P5
+     optimizations on `gpu-build` (see `benchmark.md`), `bistro_cafe_quick`
+     starts in **~22–28 s** (was ~117 s; ~4–5× faster).
   2. **Sample time** — scales with resolution × samples-per-pixel.
 - Measured: `bistro/bistro_cafe.pbrt` (1920×1080, 256spp) ≈ **481s**;
-  `bistro_cafe_quick.pbrt` (640×360, 8spp) ≈ **119s** → `bistro_cafe_quick.exr`.
+  `bistro_cafe_quick.pbrt` (640×360, 8spp): startup ~25s + a few seconds of
+  sampling → `bistro_cafe_quick.exr`.
 - To get a "few minutes" preview, lower `pixelsamples` (e.g. 16–32) rather than
-  resolution; the startup cost stays ~110s either way.
+  resolution.
+
+## ⚠️ Host memory requirement
+
+This build needs several GB of free RAM during scene setup (texture decode
+peaks). On the dev machine (16 GB total), close memory-hungry apps first —
+with **0 GB free** pbrt can fail-fast (`0xC0000409`) or hang inside CRT heap /
+loader locks, and all timings balloon 4–8×. See `benchmark.md` ("Attempted:
+texture decode-ahead overlap") for the full incident write-up.
+
+## Local submodule patches (must reapply after `git submodule update`)
+
+`pbrt.exe` must NOT import `deflate.dll`: with no DLL shipped beside the exe,
+the Windows loader resolves it via PATH and had been loading an incompatible
+copy from another product (`E:\anaconda3\Library\bin`). Two local patches fix
+this by linking libdeflate statically:
+
+- `patches/libdeflate-static-link.patch` → apply inside `src/ext/libdeflate`
+- `patches/openexr-vendored-deflate.patch` → apply inside `src/ext/openexr`
+
+```bat
+git -C src\ext\libdeflate apply ..\..\..\patches\libdeflate-static-link.patch
+git -C src\ext\openexr  apply ..\..\..\patches\openexr-vendored-deflate.patch
+```
+
+If either submodule shows as modified (`m` in `git status`), that is expected.
+
+## Verifying renders after code changes
+
+`.exr` output bytes are NOT comparable across builds (the OpenEXR deflate
+implementation changed; container streams differ). Compare pixels instead:
+
+```bat
+build\Release\imgtool.exe diff --metric MAE --reference <old.exr> <new.exr>
+```
+
+Silent exit 0 means `error.MaxValue()==0`, i.e. pixel-identical.
+A byte-level reference render lives at `bistro_ref.exr` (repo root).

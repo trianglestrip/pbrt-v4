@@ -1193,38 +1193,124 @@ NamedTextures BasicScene::CreateTextures() {
 
     LOG_VERBOSE("Starting to create remaining textures");
     Allocator alloc = threadAllocators.Get();
+
+    // Texture creation is embarrassingly parallel *except* that procedural
+    // textures (checker, mix, ...) may look up other named textures in
+    // "textures", making creation order significant.  Self-contained types
+    // therefore run in parallel into per-index slots (merged afterwards),
+    // while anything that may consult named textures keeps the original
+    // serial path.
+    auto selfContainedFloat = [](const std::string &name) {
+        return name == "imagemap" || name == "constant";
+    };
+    auto selfContainedSpectrum = [](const std::string &name) {
+        return name == "imagemap" || name == "ptex" || name == "rgb" ||
+               name == "srgb" || name == "constant";
+    };
+
     // Create the other SpectrumTypes for the spectrum textures.
-    for (const auto &tex : asyncSpectrumTextures) {
+    std::vector<SpectrumTexture> asyncUnbounded(asyncSpectrumTextures.size());
+    std::vector<SpectrumTexture> asyncIllum(asyncSpectrumTextures.size());
+    ParallelFor(0, int64_t(asyncSpectrumTextures.size()), [&](int64_t i) {
+        const auto &tex = asyncSpectrumTextures[i];
         pbrt::Transform renderFromTexture = tex.second.renderFromObject.startTransform;
         // These are all image textures, so nullptr is fine for the
         // textures, as earlier.
         TextureParameterDictionary texDict(&tex.second.parameters, nullptr);
+        Allocator texAlloc = threadAllocators.Get();
 
         // These should be fast since they should hit the texture cache
-        SpectrumTexture unboundedTex = SpectrumTexture::Create(
+        asyncUnbounded[i] = SpectrumTexture::Create(
             tex.second.name, renderFromTexture, texDict, SpectrumType::Unbounded,
-            &tex.second.loc, alloc, Options->useGPU);
-        SpectrumTexture illumTex = SpectrumTexture::Create(
+            &tex.second.loc, texAlloc, Options->useGPU);
+        asyncIllum[i] = SpectrumTexture::Create(
             tex.second.name, renderFromTexture, texDict, SpectrumType::Illuminant,
-            &tex.second.loc, alloc, Options->useGPU);
-
-        textures.unboundedSpectrumTextures[tex.first] = unboundedTex;
-        textures.illuminantSpectrumTextures[tex.first] = illumTex;
+            &tex.second.loc, texAlloc, Options->useGPU);
+    });
+    for (size_t i = 0; i < asyncSpectrumTextures.size(); ++i) {
+        textures.unboundedSpectrumTextures[asyncSpectrumTextures[i].first] =
+            asyncUnbounded[i];
+        textures.illuminantSpectrumTextures[asyncSpectrumTextures[i].first] =
+            asyncIllum[i];
     }
 
-    // And do the rest serially
-    for (auto &tex : serialFloatTextures) {
-        Allocator alloc = threadAllocators.Get();
+    // Split the serially-declared textures into self-contained (parallel)
+    // and dependent (serial) subsets.
+    std::vector<size_t> parFloatIdx, serFloatIdx;
+    for (size_t i = 0; i < serialFloatTextures.size(); ++i)
+        (selfContainedFloat(serialFloatTextures[i].second.name) ? parFloatIdx
+                                                                : serFloatIdx)
+            .push_back(i);
+
+    std::vector<std::pair<std::string, FloatTexture>> floatResults(
+        parFloatIdx.size());
+    ParallelFor(0, int64_t(parFloatIdx.size()), [&](int64_t k) {
+        const auto &tex = serialFloatTextures[parFloatIdx[k]];
+        Allocator texAlloc = threadAllocators.Get();
+        pbrt::Transform renderFromTexture = tex.second.renderFromObject.startTransform;
+        TextureParameterDictionary texDict(&tex.second.parameters, &textures);
+        floatResults[k] = {tex.first,
+                           FloatTexture::Create(tex.second.name, renderFromTexture,
+                                                texDict, &tex.second.loc, texAlloc,
+                                                Options->useGPU)};
+    });
+    for (const auto &r : floatResults)
+        textures.floatTextures[r.first] = r.second;
+
+    for (size_t fi : serFloatIdx) {
+        auto &tex = serialFloatTextures[fi];
+        Allocator texAlloc = threadAllocators.Get();
 
         pbrt::Transform renderFromTexture = tex.second.renderFromObject.startTransform;
         TextureParameterDictionary texDict(&tex.second.parameters, &textures);
         FloatTexture t = FloatTexture::Create(tex.second.name, renderFromTexture, texDict,
-                                              &tex.second.loc, alloc, Options->useGPU);
+                                              &tex.second.loc, texAlloc, Options->useGPU);
         textures.floatTextures[tex.first] = t;
     }
 
-    for (auto &tex : serialSpectrumTextures) {
-        Allocator alloc = threadAllocators.Get();
+    std::vector<size_t> parSpecIdx, serSpecIdx;
+    for (size_t i = 0; i < serialSpectrumTextures.size(); ++i)
+        (selfContainedSpectrum(serialSpectrumTextures[i].second.name) ? parSpecIdx
+                                                                      : serSpecIdx)
+            .push_back(i);
+
+    struct SpectrumTriple {
+        SpectrumTexture albedo, unbounded, illum;
+    };
+    std::vector<std::pair<std::string, SpectrumTriple>> specResults(
+        parSpecIdx.size());
+    ParallelFor(0, int64_t(parSpecIdx.size()), [&](int64_t k) {
+        const auto &tex = serialSpectrumTextures[parSpecIdx[k]];
+        Allocator texAlloc = threadAllocators.Get();
+        if (tex.second.renderFromObject.IsAnimated())
+            Warning(&tex.second.loc,
+                    "Animated world to texture transform not supported. "
+                    "Using start transform.");
+        pbrt::Transform renderFromTexture = tex.second.renderFromObject.startTransform;
+        TextureParameterDictionary texDict(&tex.second.parameters, &textures);
+        specResults[k] = {tex.first,
+                          {SpectrumTexture::Create(
+                               tex.second.name, renderFromTexture, texDict,
+                               SpectrumType::Albedo, &tex.second.loc, texAlloc,
+                               Options->useGPU),
+                           SpectrumTexture::Create(
+                               tex.second.name, renderFromTexture, texDict,
+                               SpectrumType::Unbounded, &tex.second.loc, texAlloc,
+                               Options->useGPU),
+                           SpectrumTexture::Create(
+                               tex.second.name, renderFromTexture, texDict,
+                               SpectrumType::Illuminant, &tex.second.loc, texAlloc,
+                               Options->useGPU)}};
+    });
+    for (const auto &r : specResults) {
+        textures.albedoSpectrumTextures[r.first] = r.second.albedo;
+        textures.unboundedSpectrumTextures[r.first] = r.second.unbounded;
+        textures.illuminantSpectrumTextures[r.first] = r.second.illum;
+    }
+
+    for (size_t si : serSpecIdx) {
+        auto &tex = serialSpectrumTextures[si];
+        Allocator texAlloc = threadAllocators.Get();
 
         if (tex.second.renderFromObject.IsAnimated())
             Warning(&tex.second.loc, "Animated world to texture transform not supported. "
@@ -1234,13 +1320,13 @@ NamedTextures BasicScene::CreateTextures() {
         TextureParameterDictionary texDict(&tex.second.parameters, &textures);
         SpectrumTexture albedoTex = SpectrumTexture::Create(
             tex.second.name, renderFromTexture, texDict, SpectrumType::Albedo,
-            &tex.second.loc, alloc, Options->useGPU);
+            &tex.second.loc, texAlloc, Options->useGPU);
         SpectrumTexture unboundedTex = SpectrumTexture::Create(
             tex.second.name, renderFromTexture, texDict, SpectrumType::Unbounded,
-            &tex.second.loc, alloc, Options->useGPU);
+            &tex.second.loc, texAlloc, Options->useGPU);
         SpectrumTexture illumTex = SpectrumTexture::Create(
             tex.second.name, renderFromTexture, texDict, SpectrumType::Illuminant,
-            &tex.second.loc, alloc, Options->useGPU);
+            &tex.second.loc, texAlloc, Options->useGPU);
 
         textures.albedoSpectrumTextures[tex.first] = albedoTex;
         textures.unboundedSpectrumTextures[tex.first] = unboundedTex;

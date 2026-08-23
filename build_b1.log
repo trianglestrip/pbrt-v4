@@ -1,0 +1,23 @@
+适用于 .NET Framework MSBuild 版本 17.14.40+3e7442088
+
+  Iex.vcxproj -> F:\project\pbrt-v4\build\src\ext\openexr\src\lib\Iex\Release\Iex-3_3.lib
+  glfw.vcxproj -> F:\project\pbrt-v4\build\src\ext\glfw\src\Release\glfw3.lib
+  soac.vcxproj -> F:\project\pbrt-v4\build\Release\soac.exe
+  glad.vcxproj -> F:\project\pbrt-v4\build\src\ext\glad\Release\glad.lib
+  double-conversion.vcxproj -> F:\project\pbrt-v4\build\src\ext\double-conversion\Release\double-conversion.lib
+  deflate.vcxproj -> F:\project\pbrt-v4\build\src\ext\libdeflate\Release\deflate.lib
+  utf8proc.vcxproj -> F:\project\pbrt-v4\build\src\ext\utf8proc\Release\utf8proc_static.lib
+  pbrt_taskflow.vcxproj -> F:\project\pbrt-v4\build\Release\pbrt_taskflow.lib
+  zlibstatic.vcxproj -> F:\project\pbrt-v4\build\src\ext\zlib\Release\zlibstatic.lib
+  Ptex_static.vcxproj -> F:\project\pbrt-v4\build\src\ext\ptex\src\ptex\Release\Ptex.lib
+  IlmThread.vcxproj -> F:\project\pbrt-v4\build\src\ext\openexr\src\lib\IlmThread\Release\IlmThread-3_3.lib
+  OpenEXRCore.vcxproj -> F:\project\pbrt-v4\build\src\ext\openexr\src\lib\OpenEXRCore\Release\OpenEXRCore-3_3.lib
+  pbrt_embedded_ptx_lib.vcxproj -> F:\project\pbrt-v4\build\Release\pbrt_embedded_ptx_lib.lib
+  rgb2spec_opt.vcxproj -> F:\project\pbrt-v4\build\Release\rgb2spec_opt.exe
+  OpenEXR.vcxproj -> F:\project\pbrt-v4\build\src\ext\openexr\src\lib\OpenEXR\Release\OpenEXR-3_3.lib
+  scene.cpp
+F:\project\pbrt-v4\src\ext\openvdb\nanovdb\nanovdb/NanoVDB.h(1,1): warning C4819: 该文件包含不能在当前代码页(936)中表示的字符。请将该文件保存为 Unicode 格式以防止数据丢失 [F:\project\pbrt-v4\build\pbrt_lib.vcxproj]
+  pbrt_lib.vcxproj -> F:\project\pbrt-v4\build\Release\libpbrt.lib
+    正在创建库 F:/project/pbrt-v4/build/Release/pbrt.lib 和对象 F:/project/pbrt-v4/build/Release/pbrt.exp
+LINK : warning LNK4098: 默认库“LIBCMT”与其他库的使用冲突；请使用 /NODEFAULTLIB:library [F:\project\pbrt-v4\build\pbrt_exe.vcxproj]
+  pbrt_exe.vcxproj -> F:\project\pbrt-v4\build\Release\pbrt.exe

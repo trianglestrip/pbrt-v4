@@ -357,6 +357,52 @@ baseline. On an idle machine the saving is small (idle prepare-ply is only
 13 s spike observed earlier today would have been fully hidden. Output is
 pixel-identical (`imgtool diff` MAE == 0).
 
+
+## B: parallelize texture creation (scene.cpp)
+
+BasicScene::CreateTextures was a serial loop over all named textures.
+Procedural textures (checker/mix/...) look up other named textures in
+`textures` during creation, so the code now splits each loop into a
+self-contained subset (imagemap / constant / rgb / srgb / ptex -- all of
+which never consult `textures`) that runs in parallel via `ParallelFor`,
+and a dependent subset that keeps the original serial path.  Results land
+in per-index slots and are merged serially afterwards.
+
+Note: the global thread pool is still live here (DisableThreadPool runs','only later, inside the OptiXAggregate ctor), so ParallelFor gives real','parallelism.  Scene side also stays correct for CPU builds.
+	extureCacheMutex in GPUSpectrumImageTexture::Create does NOT guard image
+decode or GPU work -- only the cache lookup + pending-upload registration --
+so it is not the speedup ceiling.
+
+Result for bistro_cafe_quick: `wpi-CreateTextures` ~12 -> ~10 s and
+`optix-ctor-total` ~12.6 -> ~10.8 s; gpu-build ~24 s median vs ~26 s
+baseline.  The win is modest because per-texture work is small and this
+machine has +-5 s variance; texture-heavy scenes would benefit more.
+Output pixel-identical (imgtool diff MAE == 0).
+
+
+## B: parallelize texture creation (scene.cpp)
+
+BasicScene::CreateTextures was a serial loop over all named textures.
+Procedural textures (checker/mix/...) look up other named textures in
+`textures` during creation, so the code now splits each loop into a
+self-contained subset (imagemap / constant / rgb / srgb / ptex -- all of
+which never consult `textures`) that runs in parallel via `ParallelFor`,
+and a dependent subset that keeps the original serial path.  Results land
+in per-index slots and are merged serially afterwards.
+
+Note: the global thread pool is still live here (DisableThreadPool runs
+only later, inside the OptiXAggregate ctor), so ParallelFor gives real
+parallelism.  The CPU build path is unchanged.
+	extureCacheMutex in GPUSpectrumImageTexture::Create guards only the cache
+lookup + pending-upload registration (not decode/GPU work), so it is not
+the speedup ceiling.
+
+Result for bistro_cafe_quick: wpi-CreateTextures ~12 -> ~10 s and
+optix-ctor-total ~12.6 -> ~10.8 s; gpu-build ~24 s median vs ~26 s
+baseline.  The win is modest because per-texture work is small and this
+machine has +-5 s variance; texture-heavy scenes benefit more.
+Output pixel-identical (imgtool diff MAE == 0).
+
 ## How to render
 
 ```bat

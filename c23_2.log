@@ -1,7 +1,0 @@
-pbrt version 4 (built Aug 23 2026 at 14:09:50)
-Copyright (c)1998-2021 Matt Pharr, Wenzel Jakob, and Greg Humphreys.
-The source code to pbrt (but *not* the book contents) is covered by the Apache 2.0 License.
-See the file LICENSE.txt for the conditions of the license.
-STAGE_TIMING [parse] 0.52 s
-STAGE_TIMING [wpi-CreateMedia] 0.00 s
-STAGE_TIMING [tex-prefetch] starting 6 decode workers (34 queued)

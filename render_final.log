@@ -1,33 +1,0 @@
-pbrt version 4 (built Aug 23 2026 at 14:09:50)
-Copyright (c)1998-2021 Matt Pharr, Wenzel Jakob, and Greg Humphreys.
-The source code to pbrt (but *not* the book contents) is covered by the Apache 2.0 License.
-See the file LICENSE.txt for the conditions of the license.
-STAGE_TIMING [parse] 0.34 s
-STAGE_TIMING [wpi-CreateMedia] 0.00 s
-STAGE_TIMING [wpi-CreateTextures] 11.81 s
-STAGE_TIMING [wpi-CreateLights] 0.69 s
-STAGE_TIMING [wpi-CreateMaterials] 0.00 s
-STAGE_TIMING [wpi-pre-flush] 13.18 s
-STAGE_TIMING [optix-init] 1.63 s
-STAGE_TIMING [optix-prepare-ply] 13.23 s
-STAGE_TIMING [optix-top-gas-builds] 0.00 s
-STAGE_TIMING [optix-ias-instance-defs] 0.00 s
-STAGE_TIMING [optix-tri-meshCreate] 2.24 s
-STAGE_TIMING [optix-tri-buildInputs] 2.24 s
-STAGE_TIMING [optix-tri-flatten] 2.33 s
-STAGE_TIMING [optix-bvh-triangles-fn] 2.43 s (nMeshes=1591)
-STAGE_TIMING [optix-bvh-triangles-upload] 0.04 s
-STAGE_TIMING [optix-top-build-tri] 2.44 s
-STAGE_TIMING [optix-top-build-blp] 0.00 s
-STAGE_TIMING [optix-top-build-quad] 0.00 s
-STAGE_TIMING [optix-instances] 2.44 s
-STAGE_TIMING [optix-accelbuild-total] 0.06 s
-STAGE_TIMING [optix-ctor-total] 17.30 s
-STAGE_TIMING [wpi-lightPreprocess] 0.00 s
-STAGE_TIMING [texture-upload] 17.38 s (147 unique textures)
-STAGE_TIMING [wpi-lightSampler] 0.31 s
-STAGE_TIMING [wpi-queueAlloc] 0.08 s
-STAGE_TIMING [wpi-post-flush] 17.74 s
-STAGE_TIMING [gpu-build+upload+bvh] 30.92 s
-Rendering: [  ] Rendering: [  ]  (0.1s|?s)  Rendering: [  ]  (0.1s|?s)  Rendering: [  ]  (0.2s|?s)  Rendering: [  ]  (0.2s|?s)  Rendering: [  ]  (0.3s|?s)  Rendering: [  ]  (0.4s|?s)  Rendering: [  ]  (0.4s|?s)  Rendering: [  ]  (0.5s|?s)  Rendering: [  ]  (0.6s|?s)  Rendering: [  ]  (0.6s|?s)  Rendering: [  ]  (0.7s|?s)  Rendering: [  ]  (0.8s|?s)  Rendering: [  ]  (0.9s|?s)  Rendering: [  ]  (1.0s|?s)  Rendering: [  ]  (1.2s|?s)  Rendering: [  ]  (1.3s|?s)  Rendering: [  ]  (1.4s|?s)  Rendering: [  ]  (1.5s|?s)  Rendering: [  ]  (1.6s|?s)  Rendering: [  ]  (1.7s|?s)  Rendering: [  ]  (1.8s|?s)  Rendering: [  ]  (1.9s|13.4s)  Rendering: [++]  (2.0s|0.7s)  Rendering: [++]  (2.1s)       Rendering: [++]  (2.1s)       
-STAGE_TIMING [render-total] 33.16 s

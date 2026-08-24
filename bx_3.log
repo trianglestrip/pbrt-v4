@@ -1,35 +1,0 @@
-pbrt version 4 (built Aug 23 2026 at 14:09:50)
-Copyright (c)1998-2021 Matt Pharr, Wenzel Jakob, and Greg Humphreys.
-The source code to pbrt (but *not* the book contents) is covered by the Apache 2.0 License.
-See the file LICENSE.txt for the conditions of the license.
-STAGE_TIMING [parse] 4.21 s
-STAGE_TIMING [wpi-CreateMedia] 0.00 s
-STAGE_TIMING [ply-preload] started in background
-STAGE_TIMING [wpi-CreateTextures] 11.55 s
-STAGE_TIMING [wpi-CreateLights] 3.06 s
-STAGE_TIMING [wpi-CreateMaterials] 0.00 s
-STAGE_TIMING [wpi-pre-flush] 14.62 s
-STAGE_TIMING [ply-preload] ready (850 meshes)
-STAGE_TIMING [optix-init] 0.02 s
-STAGE_TIMING [optix-prepare-ply] 0.00 s
-STAGE_TIMING [optix-top-gas-builds] 0.00 s
-STAGE_TIMING [optix-ias-instance-defs] 0.00 s
-STAGE_TIMING [optix-tri-meshCreate] 8.46 s
-STAGE_TIMING [optix-tri-buildInputs] 8.49 s
-STAGE_TIMING [optix-tri-flatten] 9.18 s
-STAGE_TIMING [optix-bvh-triangles-fn] 9.68 s (nMeshes=1591)
-STAGE_TIMING [optix-bvh-triangles-upload] 0.30 s
-STAGE_TIMING [optix-top-build-tri] 9.75 s
-STAGE_TIMING [optix-top-build-blp] 0.00 s
-STAGE_TIMING [optix-top-build-quad] 0.00 s
-STAGE_TIMING [optix-instances] 9.76 s
-STAGE_TIMING [optix-accelbuild-total] 0.19 s
-STAGE_TIMING [optix-ctor-total] 9.78 s
-STAGE_TIMING [wpi-lightPreprocess] 0.00 s
-STAGE_TIMING [wpi-lightSampler] 2.47 s
-STAGE_TIMING [wpi-queueAlloc] 0.91 s
-STAGE_TIMING [wpi-post-flush] 13.79 s
-STAGE_TIMING [texture-upload] 19.60 s (147 unique textures)
-STAGE_TIMING [gpu-build+upload+bvh] 44.35 s
-Rendering: [  ] Rendering: [  ]  (0.1s|?s)  Rendering: [  ]  (0.1s|?s)  Rendering: [  ]  (0.2s|?s)  Rendering: [  ]  (0.2s|?s)  Rendering: [  ]  (0.3s|?s)  Rendering: [  ]  (0.4s|?s)  Rendering: [  ]  (0.4s|?s)  Rendering: [  ]  (0.5s|?s)  Rendering: [  ]  (0.6s|?s)  Rendering: [  ]  (0.6s|?s)  Rendering: [  ]  (0.7s|5.1s)  Rendering: [+ ]  (0.8s|0.8s)  Rendering: [++]  (0.9s)       Rendering: [++]  (0.9s)       
-STAGE_TIMING [render-total] 45.93 s

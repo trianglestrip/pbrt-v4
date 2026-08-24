@@ -1,35 +1,0 @@
-pbrt version 4 (built Aug 23 2026 at 14:09:50)
-Copyright (c)1998-2021 Matt Pharr, Wenzel Jakob, and Greg Humphreys.
-The source code to pbrt (but *not* the book contents) is covered by the Apache 2.0 License.
-See the file LICENSE.txt for the conditions of the license.
-STAGE_TIMING [parse] 2.52 s
-STAGE_TIMING [wpi-CreateMedia] 0.00 s
-STAGE_TIMING [ply-preload] started in background
-STAGE_TIMING [wpi-CreateTextures] 10.10 s
-STAGE_TIMING [wpi-CreateLights] 2.67 s
-STAGE_TIMING [wpi-CreateMaterials] 0.00 s
-STAGE_TIMING [wpi-pre-flush] 12.78 s
-STAGE_TIMING [ply-preload] ready (850 meshes)
-STAGE_TIMING [optix-init] 0.02 s
-STAGE_TIMING [optix-prepare-ply] 0.00 s
-STAGE_TIMING [optix-top-gas-builds] 0.00 s
-STAGE_TIMING [optix-ias-instance-defs] 0.00 s
-STAGE_TIMING [optix-tri-meshCreate] 10.48 s
-STAGE_TIMING [optix-tri-buildInputs] 10.51 s
-STAGE_TIMING [optix-tri-flatten] 11.42 s
-STAGE_TIMING [optix-bvh-triangles-fn] 11.86 s (nMeshes=1591)
-STAGE_TIMING [optix-bvh-triangles-upload] 0.33 s
-STAGE_TIMING [optix-top-build-tri] 11.93 s
-STAGE_TIMING [optix-top-build-blp] 0.00 s
-STAGE_TIMING [optix-top-build-quad] 0.00 s
-STAGE_TIMING [optix-instances] 11.93 s
-STAGE_TIMING [optix-accelbuild-total] 0.11 s
-STAGE_TIMING [optix-ctor-total] 11.95 s
-STAGE_TIMING [wpi-lightPreprocess] 0.00 s
-STAGE_TIMING [wpi-lightSampler] 2.60 s
-STAGE_TIMING [wpi-queueAlloc] 1.38 s
-STAGE_TIMING [wpi-post-flush] 16.43 s
-STAGE_TIMING [texture-upload] 21.69 s (147 unique textures)
-STAGE_TIMING [gpu-build+upload+bvh] 43.55 s
-Rendering: [  ] Rendering: [  ]  (0.1s|?s)  Rendering: [  ]  (0.1s|?s)  Rendering: [  ]  (0.2s|?s)  Rendering: [  ]  (0.2s|?s)  Rendering: [  ]  (0.3s|?s)  Rendering: [  ]  (0.4s|?s)  Rendering: [  ]  (0.4s|?s)  Rendering: [  ]  (0.5s|?s)  Rendering: [  ]  (0.6s|?s)  Rendering: [  ]  (0.6s|?s)  Rendering: [  ]  (0.7s|?s)  Rendering: [  ]  (0.8s|5.8s)  Rendering: [+ ]  (0.9s|0.6s)  Rendering: [++]  (1.0s)       Rendering: [++]  (1.0s)       
-STAGE_TIMING [render-total] 44.93 s
